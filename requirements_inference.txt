@@ -1,0 +1,13 @@
+polyscope==2.5.0
+typing==3.7.4.3
+trimesh==4.8.1
+Pillow==11.0.0
+safetensors==0.6.2
+easydict==1.13
+scipy==1.14.1
+git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+git+https://github.com/NVlabs/nvdiffrast.git@v0.3.3
+pyparsing==3.2.3
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+matplotlib==3.7.5

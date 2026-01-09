@@ -1,0 +1,59 @@
+{
+  "simulation": {
+    "dt": 0.01,
+    "gravity": [0.0, -9.8, 0.0],
+    "max_frames": 500,
+    "auto_start": false,
+    "contact": {
+      "friction_enable": true,
+      "d_hat": 0.005
+    }
+  },
+  "engine": {
+    "type": "cuda"
+  },
+  "contact_model": {
+    "friction": 0.5,
+    "contact_resistance": 2.0
+  },
+  "ground": {
+    "enable": true,
+    "height": 0.0
+  },
+  "objects": [
+    {
+      "name": "zag_middle_base",
+      "type": "msh",
+      "msh_path": "assets/zag/zag_middle_inst_base.msh",
+      "normalize_visual_mesh": false,
+      "scale": 1.0,
+      "translation": [0.0, 0.001, 0.0],
+      "rotation": [270.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/zag/materials.npz"
+      }
+    },
+    {
+      "name": "orange_1",
+      "type": "msh",
+      "msh_path": "assets/orange/orange_02_inst_base.msh",
+      "normalize_visual_mesh": false,
+      "scale": 3.0,
+      "translation": [0.0, 2.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/orange/materials.npz"
+      }
+    }
+  ],
+  "gui": {
+    "enable": true
+  },
+  "output": {
+    "directory": "./outputs/simulation_output/zag_and_falling_orange",
+    "save_meshes": true
+  },
+  "logging": {
+    "level": "warn"
+  }
+} 

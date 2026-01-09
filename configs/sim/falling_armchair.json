@@ -1,0 +1,48 @@
+{
+  "simulation": {
+    "dt": 0.01,
+    "gravity": [0.0, -9.8, 0.0],
+    "max_frames": 500,
+    "auto_start": false,
+    "contact": {
+      "friction_enable": true,
+      "d_hat": 0.01
+    }
+  },
+  "engine": {
+    "type": "cuda"
+  },
+  "contact_model": {
+    "friction": 0.5,
+    "contact_resistance": 1.0
+  },
+  "ground": {
+    "enable": true,
+    "height": 0.0
+  },
+  "objects": [
+    {
+      "name": "armchair_1",
+      "type": "msh",
+      "msh_path": "assets/armchair/armchair.msh",
+      "visual_mesh": "assets/armchair/armchair_inst_base.obj",
+      "normalize_visual_mesh": false,
+      "scale": 1.0,
+      "translation": [0.0, 1.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/armchair/materials_aligned.npz"
+      }
+    }
+  ],
+  "gui": {
+    "enable": true
+  },
+  "output": {
+    "directory": "./outputs/simulation_output/falling_armchair",
+    "save_meshes": true
+  },
+  "logging": {
+    "level": "warn"
+  }
+} 

@@ -1,0 +1,23 @@
+gradio
+-e git+https://github.com/nv-tlabs/vomp.git#egg=vomp
+polyscope==2.5.0
+typing==3.7.4.3
+trimesh==4.8.1
+Pillow==11.0.0
+safetensors==0.6.2
+easydict==1.13
+scipy==1.14.1
+git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+pyparsing==3.2.3
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+matplotlib==3.7.5
+torch==2.4.0
+torch-tensorrt==2.4.0
+torchvision==0.19.0
+xformers==0.0.27.post2
+git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+spconv-cu120
+--find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
+kaolin==0.18.0

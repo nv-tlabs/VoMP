@@ -1,0 +1,1 @@
+libuipc simulation code is present in the [`vomp/sim/`](../vomp/sim/) directory. Refer to the [README](../README.md) for instructions on how to run them.

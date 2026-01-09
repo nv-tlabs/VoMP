@@ -1,0 +1,11 @@
+__pycache__
+.vscode
+*.ini
+**/outputs
+*.png
+*.usd
+*.nsys-rep
+*.pt
+*.mp4
+*.swp
+simulations/material_grids_generated.py

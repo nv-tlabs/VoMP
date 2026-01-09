@@ -1,0 +1,80 @@
+{
+  "simulation": {
+    "dt": 0.02,
+    "gravity": [0.0, -9.8, 0.0],
+    "max_frames": 500,
+    "auto_start": false,
+    "contact": {
+      "friction_enable": true,
+      "d_hat": 0.01
+    }
+  },
+  "engine": {
+    "type": "cuda"
+  },
+  "contact_model": {
+    "friction": 0.5,
+    "contact_resistance": 1.0
+  },
+  "ground": {
+    "enable": true,
+    "height": 0.0
+  },
+  "objects": [
+    {
+      "name": "orange_1",
+      "type": "voxel",
+      "voxel_path": "assets/orange/voxels.ply",
+      "visual_mesh": "assets/orange/orange_02_inst_base.obj",
+      "normalize_visual_mesh": true,
+      "voxel_size": 1.0,
+      "scale": 1.0,
+      "max_voxels": 32000,
+      "translation": [0.0, 2.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/orange/materials.npz"
+      }
+    },
+    {
+      "name": "orange_2",
+      "type": "voxel",
+      "voxel_path": "assets/orange/voxels.ply",
+      "visual_mesh": "assets/orange/orange_02_inst_base.obj",
+      "normalize_visual_mesh": true,
+      "voxel_size": 1.0,
+      "scale": 1.0,
+      "max_voxels": 32000,
+      "translation": [0.0, 3.5, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/orange/materials.npz"
+      }
+    },
+    {
+      "name": "orange_3",
+      "type": "voxel",
+      "voxel_path": "assets/orange/voxels.ply",
+      "visual_mesh": "assets/orange/orange_02_inst_base.obj",
+      "normalize_visual_mesh": true,
+      "voxel_size": 1.0,
+      "scale": 1.0,
+      "max_voxels": 32000,
+      "translation": [0.0, 5.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "material": {
+        "file": "assets/orange/materials.npz"
+      }
+    }
+  ],
+  "gui": {
+    "enable": true
+  },
+  "output": {
+    "directory": "./outputs/simulation_output/falling_oranges",
+    "save_meshes": true
+  },
+  "logging": {
+    "level": "warn"
+  }
+} 

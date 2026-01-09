@@ -1,0 +1,1 @@
+Refer to the [Simplicits](https://kaolin.readthedocs.io/en/latest/notes/simplicits.html) documentation for instructions on how to run Simplicits simulations which are directly compatible with our properties.
