@@ -14,30 +14,35 @@
 # limitations under the License.
 
 import argparse
-import math
 import gc
-from typing import Any, Optional
+import math
+from typing import Any, Callable, Optional
 
 import warp as wp
 import warp.fem as fem
 import warp.sparse as sp
+from warp.examples.fem.utils import bsr_cg
 from warp.fem import Domain, Field, Sample
 from warp.fem.utils import array_axpy
 
-from fem_examples.mfem.linalg import MFEMSystem
-from fem_examples.mfem.softbody_sim import (
-    SoftbodySim,
-    defgrad,
-)
-
-from fem_examples.mfem.elastic_models import hooke_energy, hooke_stress, hooke_hessian
-from fem_examples.mfem.elastic_models import (
+from .elastic_models import (
+    hooke_energy,
+    hooke_hessian,
+    hooke_stress,
+    snh_energy,
+    snh_hessian_proj,
+    snh_stress,
     symmetric_strain,
     symmetric_strain_delta,
-    snh_energy,
-    snh_stress,
-    snh_hessian_proj,
 )
+from .linalg import MFEMSystem, project_system_rhs, project_system_matrix
+from .linesearch import (
+    LineSearchLagrangianArmijoCriterion,
+    LineSearchMeritCriterion,
+    LineSearchMultiObjCriterion,
+)
+from .softbody_sim import SoftbodySim, defgrad
+
 
 wp.set_module_options({"enable_backward": False})
 wp.set_module_options({"max_unroll": 4})
@@ -113,9 +118,7 @@ def rotation_matrix(rot_vec: wp.vec3):
 
 
 @wp.kernel
-def apply_rotation_delta(
-    r_vec: wp.array(dtype=wp.vec3), dR: wp.array(dtype=wp.vec3), alpha: float
-):
+def apply_rotation_delta(r_vec: wp.array(dtype=wp.vec3), dR: wp.array(dtype=wp.vec3), alpha: float):
     i = wp.tid()
 
     Q = wp.quat_from_axis_angle(wp.normalize(r_vec[i]), wp.length(r_vec[i]))
@@ -139,114 +142,28 @@ def tensor_mass_form(s: Sample, sig: Field, tau: Field):
     return wp.ddot(sig(s), tau(s))
 
 
-class LineSearchMeritCriterion:
-    # Numeric Optimization, chapter 15.4
+def _run_capturable(fn: Callable, use_graph: bool, graph):
+    if use_graph and graph is None:
+        try:
+            gc.collect(0)
+            gc.disable()
+            with wp.ScopedCapture(force_module_load=False) as capture:
+                fn()
+                gc.collect(0)
+            gc.enable()
+            graph = capture.graph
+        except Exception as err:
+            wp.utils.warn(
+                f"Graph capture of function '{fn.__name__}' failed: {err}",
+                category=RuntimeWarning,
+            )
 
-    def __init__(self, sim: SoftbodySim):
-        self.armijo_coeff = 0.0001
+    if graph is None:
+        fn()
+    else:
+        wp.capture_launch(graph)
 
-    def build_linear_model(self, sim, lhs, rhs, delta_fields):
-        delta_u, dS, dR, dLambda = delta_fields
-
-        c_k = rhs[3]
-        c_k_normalized = wp.empty_like(c_k)
-
-        wp.launch(
-            self._normalize_c_k,
-            inputs=[c_k, c_k_normalized, sim._stiffness_field.dof_values],
-            dim=c_k.shape,
-        )
-
-        delta_ck = lhs._B @ delta_u
-        sp.bsr_mv(A=lhs._Cs, x=dS, y=delta_ck, alpha=-1.0, beta=1.0)
-
-        if lhs._Cr is not None:
-            sp.bsr_mv(A=lhs._Cr, x=dR, y=delta_ck, alpha=-1.0, beta=1.0)
-
-        m = wp.utils.array_inner(dS, sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
-            delta_u, sim._minus_dE_du.view(delta_u.dtype)
-        ) * wp.utils.array_inner(c_k_normalized, delta_ck.view(c_k_normalized.dtype))
-
-        self.m = m
-
-    def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
-        f_cur = E_cur + C_cur
-        f_ref = E_ref + C_ref
-
-        return f_cur <= f_ref + self.armijo_coeff * alpha * self.m
-
-    @wp.kernel
-    def _normalize_c_k(
-        c_k: wp.array(dtype=Any),
-        c_k_norm: wp.array(dtype=Any),
-        scale: wp.array(dtype=float),
-    ):
-        i = wp.tid()
-        c_k_norm[i] = wp.normalize(c_k[i]) * scale[i]
-
-
-class LineSearchMultiObjCriterion:
-    # Line Search Filter Methods for Nonlinear Programming: Motivation and Global Convergence
-    # 2005, SIAM Journal on Optimization 16(1):1-31
-
-    def __init__(self, sim: SoftbodySim):
-        # constraint decrease
-        E_scale = sim.typical_stiffness / sim.lame_ref[1]
-        self.gamma_theta = 0.75
-        self.gamma_f = 0.1 * E_scale
-
-        # switching rule
-        self.s_theta = 1.5
-        self.s_rho = 2.5 * self.s_theta
-        self.delta = 0.01 * E_scale ** (self.s_theta / self.s_rho)
-
-        self.armijo_coeff = 0.0001
-
-    def build_linear_model(self, sim, lhs, rhs, delta_fields):
-        delta_u, dS, dR, dLambda = delta_fields
-        m = wp.utils.array_inner(dS, sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
-            delta_u, sim._minus_dE_du.view(delta_u.dtype)
-        )
-        self.m = m
-
-    def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
-        if (
-            self.m < 0.0
-            and (-self.m) ** self.s_rho * alpha > self.delta * C_ref**self.s_theta
-        ):
-            return E_cur <= E_ref + self.armijo_coeff * alpha * self.m
-
-        return C_cur <= (1.0 - self.gamma_theta) * C_ref or (
-            E_cur <= E_ref - self.gamma_f * C_ref
-        )
-
-
-class LineSearchLagrangianArmijoCriterion:
-    # Unconstrained line-search based on Lagrangian
-
-    def __init__(self, sim: SoftbodySim):
-        self.armijo_coeff = 0.0001
-
-    def build_linear_model(self, sim, lhs, rhs, delta_fields):
-        delta_u, dS, dR, dLambda = delta_fields
-
-        m = wp.utils.array_inner(dS, sim._dE_dS.view(dS.dtype)) - wp.utils.array_inner(
-            delta_u, sim._minus_dE_du.view(delta_u.dtype)
-        )
-
-        c_k = rhs[3]
-        delta_ck = lhs._B @ delta_u
-        sp.bsr_mv(A=lhs._Cs, x=dS, y=delta_ck, alpha=-1.0, beta=1.0)
-        if lhs._Cr is not None:
-            sp.bsr_mv(A=lhs._Cr, x=dR, y=delta_ck, alpha=-1.0, beta=1.0)
-
-        c_m = wp.utils.array_inner(c_k, dLambda.view(c_k.dtype)) + wp.utils.array_inner(
-            delta_ck, sim.constraint_field.dof_values.view(delta_ck.dtype)
-        )
-        self.m = m - c_m
-
-    def accept(self, alpha, E_cur, C_cur, E_ref, C_ref):
-        return E_cur + C_cur <= E_ref + C_ref + self.armijo_coeff * alpha * self.m
+    return graph
 
 
 class MFEM(SoftbodySim):
@@ -266,7 +183,7 @@ class MFEM(SoftbodySim):
             self._ls = LineSearchMultiObjCriterion(self)
 
         # Temp storage for energy cuda graph
-        self._E = wp.empty(3, dtype=wp.float64)
+        self._E = wp.empty(3, dtype=wp.float32)
         self._E_pinned = wp.empty_like(self._E, device="cpu", pinned=True)
         self._E_graph = None
 
@@ -287,14 +204,14 @@ class MFEM(SoftbodySim):
             self.elastic_hessian_form = MFEM.hooke_elasticity_hessian_form
 
     def _init_strain_basis(self):
-        if isinstance(self.geo.reference_cell(), fem.geometry.element.Cube):
-            strain_degree = self.args.degree
-            strain_basis = fem.ElementBasis.LAGRANGE
-            strain_poly = fem.Polynomial.GAUSS_LEGENDRE
-        else:
+        if isinstance(self.geo.base, fem.Tetmesh):
             strain_degree = self.args.degree - 1
             strain_basis = fem.ElementBasis.NONCONFORMING_POLYNOMIAL
             strain_poly = None
+        else:
+            strain_degree = self.args.degree
+            strain_basis = fem.ElementBasis.LAGRANGE
+            strain_poly = fem.Polynomial.GAUSS_LEGENDRE
 
         self._strain_basis = fem.make_polynomial_basis_space(
             self.geo,
@@ -307,9 +224,7 @@ class MFEM(SoftbodySim):
     def init_strain_spaces(self, constraint_dof_mapper: fem.DofMapper):
         sym_space = fem.make_collocated_function_space(
             self._strain_basis,
-            dof_mapper=fem.SymmetricTensorMapper(
-                wp.mat33, mapping=fem.SymmetricTensorMapper.Mapping.DB16
-            ),
+            dof_mapper=fem.SymmetricTensorMapper(wp.mat33, mapping=fem.SymmetricTensorMapper.Mapping.DB16),
         )
 
         # Function spaces for piecewise-constant per-element rotations and rotation vectors
@@ -328,60 +243,36 @@ class MFEM(SoftbodySim):
 
         strain_space_partition = fem.make_space_partition(
             space_topology=self._strain_basis.topology,
-            geometry_partition=self._geo_partition,
+            geometry_partition=self.geo_partition,
             with_halo=False,
         )
 
         # Defines some fields over our function spaces
-        self.S = sym_space.make_field(
-            space_partition=strain_space_partition
-        )  # Rotated symmetric train
+        self.S = sym_space.make_field(space_partition=strain_space_partition)  # Rotated symmetric train
         self.S.dof_values.fill_(
-            sym_space.dof_mapper.value_to_dof(
-                wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-            )
+            sym_space.dof_mapper.value_to_dof(wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
         )  # initialize with identity
 
-        self.R = rot_space.make_field(
-            space_partition=strain_space_partition
-        )  # Rotation
+        self.R = rot_space.make_field(space_partition=strain_space_partition)  # Rotation
 
-        self.constraint_field = constraint_space.make_field(
-            space_partition=strain_space_partition
-        )
+        self.constraint_field = constraint_space.make_field(space_partition=strain_space_partition)
 
         # Since our spaces are constant, we can also predefine the test/trial functions that we will need for integration
         domain = self.u_test.domain
-        self.sym_test = fem.make_test(
-            space=sym_space, space_partition=strain_space_partition, domain=domain
-        )
-        self.sym_trial = fem.make_trial(
-            space=sym_space, space_partition=strain_space_partition, domain=domain
-        )
+        self.sym_test = fem.make_test(space=sym_space, space_partition=strain_space_partition, domain=domain)
+        self.sym_trial = fem.make_trial(space=sym_space, space_partition=strain_space_partition, domain=domain)
 
-        self.skew_test = fem.make_test(
-            space=skew_space, space_partition=strain_space_partition, domain=domain
-        )
-        self.skew_trial = fem.make_trial(
-            space=skew_space, space_partition=strain_space_partition, domain=domain
-        )
+        self.skew_test = fem.make_test(space=skew_space, space_partition=strain_space_partition, domain=domain)
+        self.skew_trial = fem.make_trial(space=skew_space, space_partition=strain_space_partition, domain=domain)
 
-        self.constraint_test = fem.make_test(
-            space=constraint_space, space_partition=strain_space_partition
-        )
+        self.constraint_test = fem.make_test(space=constraint_space, space_partition=strain_space_partition)
 
         # self.strain_quadrature = fem.RegularQuadrature(self.sym_test.domain, order=2 * sym_space.degree)
         # self.elasticity_quadrature = fem.RegularQuadrature(self.sym_test.domain, order=2 * sym_space.degree)
-        self.strain_quadrature = fem.NodalQuadrature(
-            self.sym_test.domain, space=sym_space
-        )
-        self.elasticity_quadrature = fem.NodalQuadrature(
-            self.sym_test.domain, space=sym_space
-        )
+        self.strain_quadrature = fem.NodalQuadrature(self.sym_test.domain, space=sym_space)
+        self.elasticity_quadrature = fem.NodalQuadrature(self.sym_test.domain, space=sym_space)
 
-        self._stiffness_field = fem.make_collocated_function_space(
-            self._strain_basis, dtype=float
-        ).make_field()
+        self._stiffness_field = fem.make_collocated_function_space(self._strain_basis, dtype=float).make_field()
         fem.interpolate(
             MFEM._typical_stiffness_field,
             fields={"lame": self.lame_field},
@@ -403,15 +294,11 @@ class MFEM(SoftbodySim):
         self._dE_dS = wp.empty_like(self._f)
         self._dE_dR = wp.empty_like(self._w)
 
-        self._schur_work_arrays = None
-
     def reset_fields(self):
         super().reset_fields()
 
         self.S.dof_values.fill_(
-            self.S.space.dof_mapper.value_to_dof(
-                wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-            )
+            self.S.space.dof_mapper.value_to_dof(wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
         )  # initialize with identity
         self.R.dof_values.zero_()
         self.constraint_field.dof_values.zero_()
@@ -443,13 +330,9 @@ class MFEM(SoftbodySim):
 
     def _apply_rotation_delta(self, dR, alpha):
         wp.copy(src=self._R_cur, dest=self.R.dof_values)
-        wp.launch(
-            apply_rotation_delta, dim=dR.shape[0], inputs=[self.R.dof_values, dR, alpha]
-        )
+        wp.launch(apply_rotation_delta, dim=dR.shape[0], inputs=[self.R.dof_values, dR, alpha])
 
-    def _evaluate_energy(self, E_u, E_e, c_r, lagrangian=False):
-        super().evaluate_energy(E_u=E_u)
-
+    def _evaluate_energy(self, E_e, c_r, lagrangian=False):
         fem.integrate(
             self.elastic_energy_form,
             quadrature=self.elasticity_quadrature,
@@ -473,7 +356,7 @@ class MFEM(SoftbodySim):
         else:
             c_k = wp.empty_like(self.constraint_field.dof_values, requires_grad=False)
             self._evaluate_constraint_residual(out=c_k)
-            c_k_norm = wp.empty(shape=c_k.shape, dtype=wp.float64)
+            c_k_norm = wp.empty(shape=c_k.shape, dtype=wp.float32)
             wp.launch(
                 MFEM.constraint_norm,
                 dim=c_k.shape,
@@ -482,35 +365,21 @@ class MFEM(SoftbodySim):
             wp.utils.array_sum(c_k_norm, out=c_r)
 
     def evaluate_energy(self):
+        self._E.zero_()
+
         E_u = self._E[0:1]
         E_e = self._E[1:2]
         c_r = self._E[2:3]
 
+        super().evaluate_energy(E_u=E_u)
+
         lagrangian = self._lagrangian_constraint_energy
 
-        if (
-            self.args.cuda_graphs
-            and self.__class__._ENERGY_MODULES_LOADED
-            and self._E_graph is None
-        ):
-            try:
-                gc.collect(0)
-                gc.disable()
-                with wp.ScopedCapture(force_module_load=False) as capture:
-                    self._evaluate_energy(E_u, E_e, c_r, lagrangian=lagrangian)
-                    wp.copy(src=self._E, dest=self._E_pinned)
-                    gc.collect(0)
-                gc.enable()
-                self._E_graph = capture.graph
-            except Exception as err:
-                print("Energy graph capture failed", err)
-
-        if self._E_graph is None:
-            self._evaluate_energy(E_u, E_e, c_r, lagrangian=lagrangian)
+        def eval_E():
+            self._evaluate_energy(E_e, c_r, lagrangian=lagrangian)
             wp.copy(src=self._E, dest=self._E_pinned)
-            self.__class__._ENERGY_MODULES_LOADED = True
-        else:
-            wp.capture_launch(self._E_graph)
+
+        self._E_graph = _run_capturable(eval_E, self.args.cuda_graphs, self._E_graph)
 
         wp.synchronize_stream()
 
@@ -524,18 +393,10 @@ class MFEM(SoftbodySim):
         if self.args.fp64:
             lhs = lhs.cast(wp.float64)
 
-        if self._schur_work_arrays is None:
-            self._schur_work_arrays = sp.bsr_mm_work_arrays()
-            reuse_topology = False
-        else:
-            reuse_topology = True
-
         return lhs.solve_schur(
             rhs,
             max_iters=self.args.cg_iters,
             tol=self.args.cg_tol,
-            work_arrays=self._schur_work_arrays,
-            reuse_topology=reuse_topology,
         )
 
     def newton_rhs(self, tape: wp.Tape = None):
@@ -557,31 +418,7 @@ class MFEM(SoftbodySim):
             w = self._w
             c_k = self._c_k
 
-            if (
-                self.args.cuda_graphs
-                and self.__class__._RHS_MODULES_LOADED
-                and self._rhs_graph is None
-            ):
-                try:
-                    gc.collect(0)
-                    gc.disable()
-                    with wp.ScopedCapture(force_module_load=False) as capture:
-                        self._assemble_rhs(
-                            u_rhs,
-                            f,
-                            w,
-                            c_k,
-                            minus_dE_dU=self._minus_dE_du,
-                            dE_dS=self._dE_dS,
-                            dE_dR=self._dE_dR,
-                        )
-                        gc.collect(0)
-                    gc.enable()
-                    self._rhs_graph = capture.graph
-                except Exception as err:
-                    print("RHS CAPTURE FAILED", err)
-
-            if self._rhs_graph is None:
+            def eval_rhs():
                 self._assemble_rhs(
                     u_rhs,
                     f,
@@ -591,9 +428,8 @@ class MFEM(SoftbodySim):
                     dE_dS=self._dE_dS,
                     dE_dR=self._dE_dR,
                 )
-                self.__class__._RHS_MODULES_LOADED = True
-            else:
-                wp.capture_launch(self._rhs_graph)
+
+            self._rhs_graph = _run_capturable(eval_rhs, self.args.cuda_graphs, self._rhs_graph)
 
         # Displacement boundary condition -- Filter u rhs
         self._filter_forces(u_rhs, tape=tape)
@@ -616,9 +452,7 @@ class MFEM(SoftbodySim):
                 *(wp.zeros_like(field) for field in rhs[1:-1]),
                 self.constraint_field.dof_values.grad,
             )
-            delta_du, dS, dR, dLambda = lhs.cast(wp.float64).solve_schur(
-                adj_res, max_iters=self.args.cg_iters
-            )
+            delta_du, dS, dR, dLambda = lhs.cast(wp.float64).solve_schur(adj_res, max_iters=self.args.cg_iters)
 
             u_rhs, f, w_lambda, c_k = rhs
             wp.copy(src=delta_du, dest=u_rhs.grad)
@@ -662,9 +496,7 @@ class MFEM(SoftbodySim):
         # Scale by inverse mass
 
         if self._mass is None:
-            mass_test = fem.make_test(
-                self._mass_space, space_partition=self.u_test.space_partition
-            )
+            mass_test = fem.make_test(self._mass_space, space_partition=self.u_test.space_partition)
             self._mass = fem.integrate(
                 self.mass_form,
                 quadrature=self.strain_quadrature,
@@ -680,11 +512,9 @@ class MFEM(SoftbodySim):
 
     @staticmethod
     def add_parser_arguments(parser: argparse.ArgumentParser):
-        super(MFEM, MFEM).add_parser_arguments(parser)
+        SoftbodySim.add_parser_arguments(parser)
 
-        parser.add_argument(
-            "--cuda-graphs", action=argparse.BooleanOptionalAction, default=True
-        )
+        parser.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True)
         parser.add_argument(
             "--line-search",
             "-ls",
@@ -697,9 +527,7 @@ class MFEM(SoftbodySim):
         return p(s)
 
     @wp.kernel
-    def scale_interpolated_quantity(
-        qtt: wp.array(dtype=wp.mat33), mass: wp.array(dtype=float)
-    ):
+    def scale_interpolated_quantity(qtt: wp.array(dtype=wp.mat33), mass: wp.array(dtype=float)):
         i = wp.tid()
         qtt[i] = qtt[i] / mass[i]
 
@@ -708,15 +536,11 @@ class MFEM(SoftbodySim):
         return wp.min(lame(s))
 
     @fem.integrand
-    def hooke_elasticity_hessian_form(
-        s: Sample, domain: Domain, S: Field, tau: Field, sig: Field, lame: Field
-    ):
+    def hooke_elasticity_hessian_form(s: Sample, domain: Domain, S: Field, tau: Field, sig: Field, lame: Field):
         return hooke_hessian(S(s), tau(s), sig(s), lame(s))
 
     @fem.integrand
-    def hooke_elasticity_gradient_form(
-        s: Sample, domain: Domain, tau: Field, S: Field, lame: Field
-    ):
+    def hooke_elasticity_gradient_form(s: Sample, domain: Domain, tau: Field, S: Field, lame: Field):
         return wp.ddot(tau(s), hooke_stress(S(s), lame(s)))
 
     @fem.integrand
@@ -724,15 +548,11 @@ class MFEM(SoftbodySim):
         return hooke_energy(S(s), lame(s))
 
     @fem.integrand
-    def nh_elasticity_hessian_form(
-        s: Sample, domain: Domain, S: Field, tau: Field, sig: Field, lame: Field
-    ):
+    def nh_elasticity_hessian_form(s: Sample, domain: Domain, S: Field, tau: Field, sig: Field, lame: Field):
         return snh_hessian_proj(S(s), tau(s), sig(s), lame(s))
 
     @fem.integrand
-    def nh_elasticity_gradient_form(
-        s: Sample, domain: Domain, tau: Field, S: Field, lame: Field
-    ):
+    def nh_elasticity_gradient_form(s: Sample, domain: Domain, tau: Field, S: Field, lame: Field):
         return wp.ddot(tau(s), snh_stress(S(s), lame(s)))
 
     @fem.integrand
@@ -742,19 +562,16 @@ class MFEM(SoftbodySim):
     @wp.kernel
     def constraint_norm(
         C: wp.array(dtype=Any),
-        C_norm: wp.array(dtype=wp.float64),
+        C_norm: wp.array(dtype=wp.float32),
         scale: wp.array(dtype=wp.float32),
     ):
         i = wp.tid()
         Ci = C[i]
-        C_norm[i] = wp.float64(wp.sqrt(0.5 * wp.dot(Ci, Ci)) * scale[i])
+        C_norm[i] = wp.sqrt(0.5 * wp.dot(Ci, Ci)) * scale[i]
 
 
 class MFEM_RS_F(MFEM):
     """RS = F variant"""
-
-    _RHS_MODULES_LOADED = False
-    _ENERGY_MODULES_LOADED = False
 
     def init_strain_spaces(self):
         super().init_strain_spaces(constraint_dof_mapper=FullTensorMapper())
@@ -763,9 +580,7 @@ class MFEM_RS_F(MFEM):
             self._strain_basis,
             dtype=wp.vec2,
         ).make_field(space_partition=self.sym_test.space_partition)
-        self._pen_field_restr = fem.make_restriction(
-            self._pen_field, space_restriction=self.sym_test.space_restriction
-        )
+        self._pen_field_restr = fem.make_restriction(self._pen_field, space_restriction=self.sym_test.space_restriction)
 
     def supports_discontinuities(self):
         return True
@@ -802,8 +617,22 @@ class MFEM_RS_F(MFEM):
         self._lhs = None
         self._lhs_graph = None
 
+    def compute_initial_guess(self):
+        # Self-advect
+        self.du_field.dof_values.zero_()
+        rhs = self.constraint_free_rhs(with_external_forces=False)
+
+        project_system_rhs(self.A, rhs, self.v_bd_matrix, self.v_bd_rhs)
+        bsr_cg(self.A_proj, b=rhs, x=self.du_field.dof_values, quiet=True)
+
+        array_axpy(x=self.du_field.dof_values, y=self.u_field.dof_values)
+
     def project_constant_forms(self):
         super().project_constant_forms()
+
+        self.A_proj = sp.bsr_copy(self.A)
+        project_system_matrix(self.A_proj, self.v_bd_matrix)
+        self.A_proj.nnz_sync()
 
         self.B_proj = sp.bsr_copy(self.B)
         sp.bsr_mm(x=self.B, y=self.v_bd_matrix, z=self.B_proj, alpha=-1.0, beta=1.0)
@@ -813,6 +642,8 @@ class MFEM_RS_F(MFEM):
         self.Bt_proj.nnz_sync()
 
     def prepare_newton_step(self, tape: Optional[wp.Tape] = None):
+        super().prepare_newton_step(tape)
+
         # Update penalization (no contribution to derivatives)
         backward_step = tape is not None
         fem.interpolate(
@@ -831,28 +662,15 @@ class MFEM_RS_F(MFEM):
         )
 
     def newton_lhs(self):
-        if self.args.cuda_graphs and self._lhs is not None and self._lhs_graph is None:
-            try:
-                gc.collect(0)
-                gc.disable()
-                with wp.ScopedCapture(force_module_load=False) as capture:
-                    self._assemble_lhs(self._lhs)
-                    gc.collect(0)
-                gc.enable()
-                self._lhs_graph = capture.graph
-            except Exception as err:
-                print("LHS capture failed", err)
+        def eval_lhs():
+            self._lhs = self._assemble_lhs(self._lhs)
 
-        if self._lhs_graph is None:
-            if self._lhs is None:
-                self._lhs = self._assemble_lhs()
-                self._lhs._H_pen = sp.bsr_copy(self._lhs._H)
-            else:
-                self._assemble_lhs(self._lhs)
-        else:
-            wp.capture_launch(self._lhs_graph)
+        self._lhs_graph = _run_capturable(eval_lhs, self.args.cuda_graphs, self._lhs_graph)
 
-        self._lhs._A = self.A_proj
+        A = self.constraint_free_lhs()
+        project_system_matrix(A, self.v_bd_matrix)
+        self._lhs._A = A
+
         self._lhs._B = self.B_proj
         self._lhs._Bt = self.Bt_proj
 
@@ -867,7 +685,7 @@ class MFEM_RS_F(MFEM):
                 "S": self.S,
                 "pen": self._pen_field,
             },
-            nodal=True,
+            assembly="nodal",
             output=lhs._W if lhs else None,
             output_dtype=float,
         )
@@ -875,7 +693,7 @@ class MFEM_RS_F(MFEM):
         # Grad of rotated strain w.r.t R, S
         CSk = fem.integrate(
             self.rotated_strain_form,
-            nodal=True,
+            assembly="nodal",
             fields={"sig": self.sym_trial, "R": self.R, "tau": self.constraint_test},
             output=lhs._Cs if lhs else None,
             output_dtype=float,
@@ -883,7 +701,7 @@ class MFEM_RS_F(MFEM):
         )
         CRk = fem.integrate(
             self.incremental_strain_rotation_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.S,
                 "dR": self.skew_trial,
@@ -898,7 +716,7 @@ class MFEM_RS_F(MFEM):
         # Elasticity -- use nodal integration so that H is block diagonal
         H = fem.integrate(
             self.elastic_hessian_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "S": self.S,
                 "sig": self.sym_trial,
@@ -915,20 +733,26 @@ class MFEM_RS_F(MFEM):
                 "sig": self.sym_trial,
                 "pen": self._pen_field,
             },
-            nodal=True,
+            assembly="nodal",
             output=lhs._H_pen if lhs else None,
             output_dtype=float,
         )
         fem.utils.array_axpy(x=H_pen.values, y=H.values)
 
         return MFEMSystem(
-            self.A_proj, H, W_skew, self.B_proj, CSk, CRk, Bt=self.Bt_proj
+            self.A_proj,  # placeholder, updated outside of graph
+            H,
+            W_skew,
+            self.B_proj,
+            CSk,
+            CRk,
+            Bt=self.Bt_proj,
         )
 
     def _evaluate_constraint_residual(self, out):
         fem.integrate(
             self.constraint_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "u": self.u_field,
                 "tau": self.constraint_test,
@@ -988,7 +812,7 @@ class MFEM_RS_F(MFEM):
         # Elastic stress + Lagrange multiplier
         fem.integrate(
             self.elastic_gradient_form,
-            nodal=True,
+            assembly="nodal",
             fields={"S": self.S, "tau": self.sym_test, "lame": self.lame_field},
             output=f,
             kernel_options={"enable_backward": True},
@@ -999,7 +823,7 @@ class MFEM_RS_F(MFEM):
 
         fem.integrate(
             self.strain_penalization_rhs,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.sym_test,
                 "u": self.u_field,
@@ -1014,7 +838,7 @@ class MFEM_RS_F(MFEM):
 
         fem.integrate(
             self.rotated_strain_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.sym_test,
                 "R": self.R,
@@ -1029,7 +853,7 @@ class MFEM_RS_F(MFEM):
 
         fem.integrate(
             self.rot_penalization_rhs,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.skew_test,
                 "u": self.u_field,
@@ -1046,7 +870,7 @@ class MFEM_RS_F(MFEM):
 
         fem.integrate(
             self.incremental_strain_rotation_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.S,
                 "dR": self.skew_test,
@@ -1060,15 +884,13 @@ class MFEM_RS_F(MFEM):
 
     @staticmethod
     def add_parser_arguments(parser: argparse.ArgumentParser):
-        super(MFEM_RS_F, MFEM_RS_F).add_parser_arguments(parser)
+        MFEM.add_parser_arguments(parser)
 
-        parser.add_argument("--constraint_pen", type=float, default=0.01)
+        parser.add_argument("--constraint_pen", type=float, default=0.1)
         parser.add_argument("--rot_compliance", type=float, default=0.1)
 
     @fem.integrand
-    def constraint_form(
-        domain: Domain, s: Sample, u: Field, tau: Field, R: Field, sig: Field
-    ):
+    def constraint_form(domain: Domain, s: Sample, u: Field, tau: Field, R: Field, sig: Field):
         C = defgrad(u, s) - rotation_matrix(R(s)) * sig(s)
         return wp.ddot(C, tau(s))
 
@@ -1100,9 +922,7 @@ class MFEM_RS_F(MFEM):
         return wp.ddot(tau(s), grad_h)
 
     @fem.integrand
-    def rotated_strain_form(
-        s: Sample, domain: Domain, R: Field, sig: Field, tau: Field
-    ):
+    def rotated_strain_form(s: Sample, domain: Domain, R: Field, sig: Field, tau: Field):
         """
         Form expressing variation of rotated deformation gradient with rotation increment
         R S : tau^T
@@ -1110,9 +930,7 @@ class MFEM_RS_F(MFEM):
         return wp.ddot(rotation_matrix(R(s)) * sig(s), tau(s))
 
     @fem.integrand
-    def incremental_strain_rotation_form(
-        s: Sample, domain: Domain, R: Field, dR: Field, sig: Field, tau: Field
-    ):
+    def incremental_strain_rotation_form(s: Sample, domain: Domain, R: Field, dR: Field, sig: Field, tau: Field):
         """
         Form expressing variation of rotated deformation gradient with rotation increment
         R dR S : tau^T
@@ -1143,14 +961,10 @@ class MFEM_RS_F(MFEM):
         pen: Field,
     ):
         S_s = S(s)
-        return pen(s)[0] * wp.ddot(sig(s) * S_s, tau(s) * S_s) + pen(s)[1] * wp.ddot(
-            sig(s), tau(s)
-        )
+        return pen(s)[0] * wp.ddot(sig(s) * S_s, tau(s) * S_s) + pen(s)[1] * wp.ddot(sig(s), tau(s))
 
     @fem.integrand
-    def strain_penalization_rhs(
-        s: Sample, sig: Field, u: Field, R: Field, S: Field, pen: Field
-    ):
+    def strain_penalization_rhs(s: Sample, sig: Field, u: Field, R: Field, S: Field, pen: Field):
         S_s = S(s)
         R_s = rotation_matrix(R(s))
         F_s = defgrad(u, s)
@@ -1181,18 +995,13 @@ class MFEM_RS_F(MFEM):
         sym_stress = wp.transpose(rot) * stress(s)
 
         skew_stress = sym_stress - wp.transpose(sym_stress)
-        lbd_pen = wp.sqrt(wp.ddot(skew_stress, skew_stress)) * wp.sqrt(
-            wp.ddot(strain, strain)
-        )
+        lbd_pen = wp.sqrt(wp.ddot(skew_stress, skew_stress)) * wp.sqrt(wp.ddot(strain, strain))
 
         return wp.vec2(typ_stiff, rot_compliance * lbd_pen)
 
 
 class MFEM_sF_S(MFEM):
     """s(F) = S variant (Trusty SigAsia22)"""
-
-    _RHS_MODULES_LOADED = False
-    _ENERGY_MODULES_LOADED = False
 
     def init_strain_spaces(self):
         super().init_strain_spaces(
@@ -1206,7 +1015,7 @@ class MFEM_sF_S(MFEM):
 
         self.C = fem.integrate(
             tensor_mass_form,
-            nodal=True,
+            assembly="nodal",
             fields={"sig": self.sym_trial, "tau": self.constraint_test},
             output_dtype=float,
             kernel_options={"enable_backward": True},
@@ -1235,7 +1044,7 @@ class MFEM_sF_S(MFEM):
         # Elasticity -- use nodal integration so that H is block diagonal
         H = fem.integrate(
             self.elastic_hessian_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "S": self.S,
                 "sig": self.sym_trial,
@@ -1245,12 +1054,15 @@ class MFEM_sF_S(MFEM):
             output_dtype=float,
         )
 
-        return MFEMSystem(self.A_proj, H, None, Bk_proj, self.C, None)
+        A = self.constraint_free_lhs()
+        project_system_matrix(A, self.v_bd_matrix)
+
+        return MFEMSystem(A, H, None, Bk_proj, self.C, None)
 
     def _evaluate_constraint_residual(self, out):
         fem.integrate(
             self.constraint_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "u": self.u_field,
                 "tau": self.constraint_test,
@@ -1287,7 +1099,7 @@ class MFEM_sF_S(MFEM):
         # Elastic stress + Lagrange multiplier
         fem.integrate(
             self.elastic_gradient_form,
-            nodal=True,
+            assembly="nodal",
             fields={"S": self.S, "tau": self.sym_test, "lame": self.lame_field},
             output=f,
             kernel_options={"enable_backward": True},
@@ -1298,7 +1110,7 @@ class MFEM_sF_S(MFEM):
 
         fem.integrate(
             tensor_mass_form,
-            nodal=True,
+            assembly="nodal",
             fields={
                 "sig": self.sym_test,
                 "tau": self.constraint_field,
@@ -1309,9 +1121,7 @@ class MFEM_sF_S(MFEM):
         )
 
     @fem.integrand
-    def constraint_form(
-        domain: Domain, s: Sample, u: Field, tau: Field, sig: Field, R: Field
-    ):
+    def constraint_form(domain: Domain, s: Sample, u: Field, tau: Field, sig: Field, R: Field):
         C = symmetric_strain(defgrad(u, s)) - sig(s)
         return wp.ddot(C, tau(s))
 

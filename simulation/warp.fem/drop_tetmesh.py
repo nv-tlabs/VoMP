@@ -21,12 +21,9 @@ from warp.fem import Domain, Sample, Field
 from warp.fem import integrand, normal
 
 from fem_examples.mfem.softbody_sim import ClassicFEM, run_softbody_sim
-from fem_examples.mfem.variable_density import ClassicFEMWithDensity
-from fem_examples.mfem.collisions import CollisionHandler
-
+from fem_examples.mfem.collisions import CollisionHandler, CollisionPotential
 from fem_examples.mfem.mfem_3d import MFEM_RS_F, MFEM_sF_S
 
-import warp.examples.fem.utils as fem_example_utils
 import meshio
 import numpy as np
 
@@ -36,6 +33,89 @@ from material_loader import (
     load_material_data,
 )
 from vomp.inference.utils import MaterialUpsampler
+
+
+running = False
+def _run_with_ground_ui(sim):
+    import polyscope as ps
+    import polyscope.imgui as psim
+
+    active_cells = None if sim.cells is None else sim.cells.array.numpy()
+
+    try:
+        hexes = sim.u_field.space.node_hexes()
+        if active_cells is not None:
+            hex_per_cell = len(hexes) // sim.geo.cell_count()
+            selected = np.broadcast_to(
+                (active_cells * hex_per_cell).reshape(-1, 1),
+                shape=(len(active_cells), hex_per_cell),
+            ) + np.broadcast_to(
+                np.arange(hex_per_cell).reshape(1, -1),
+                shape=(len(active_cells), hex_per_cell),
+            )
+            hexes = hexes[selected.flatten()]
+    except AttributeError:
+        hexes = None
+
+    if hexes is None:
+        try:
+            tets = sim.u_field.space.node_tets()
+            if active_cells is not None:
+                tet_per_cell = len(tets) // sim.geo.cell_count()
+                selected = np.broadcast_to(
+                    (active_cells * tet_per_cell).reshape(-1, 1),
+                    shape=(len(active_cells), tet_per_cell),
+                ) + np.broadcast_to(
+                    np.arange(tet_per_cell).reshape(1, -1),
+                    shape=(len(active_cells), tet_per_cell),
+                )
+                tets = tets[selected.flatten()]
+        except AttributeError:
+            tets = None
+    else:
+        tets = None
+
+    ps.init()
+    ps.set_ground_plane_height(sim.args.ground_height)
+
+    node_pos = sim.u_field.space.node_positions().numpy()
+    ps_vol = ps.register_volume_mesh(
+        "volume mesh", node_pos, hexes=hexes, tets=tets, edge_width=1.0
+    )
+    ps.register_volume_mesh(
+        "reference mesh",
+        node_pos,
+        hexes=hexes,
+        tets=tets,
+        edge_width=1.0,
+        enabled=False,
+    )
+
+    sim.init_constant_forms()
+    sim.project_constant_forms()
+    sim.cur_frame = 0
+
+    active_indices = sim.u_field.space_partition.space_node_indices().numpy()
+
+    def callback():
+        global running
+        _, running = psim.Checkbox("Running", running)
+        if not running:
+            return
+
+        sim.cur_frame += 1
+        if sim.args.n_frames >= 0 and sim.cur_frame > sim.args.n_frames:
+            return
+
+        with wp.ScopedTimer(f"--- Frame --- {sim.cur_frame}", synchronize=True):
+            sim.run_frame()
+
+        displaced_pos = sim.u_field.space.node_positions().numpy()
+        displaced_pos[active_indices] += sim.u_field.dof_values.numpy()
+        ps_vol.update_vertex_positions(displaced_pos)
+
+    ps.set_user_callback(callback)
+    ps.show()
 
 
 @wp.func
@@ -65,7 +145,6 @@ def clamped_edge(
 
     clamped = float(0.0)
 
-    # Single clamped edge
     if s.qp_index < 10:
         clamped = 1.0
 
@@ -85,7 +164,7 @@ def clamped_right(
     clamped = float(0.0)
 
     # clamped right sides
-    clamped = 0.0  # wp.select(pos[0] < 1.0, 1.0, 0.0)
+    clamped = 0.0  # wp.where(pos[0] < 1.0, 0.0, 1.0)
 
     return wp.dot(u(s), v(s)) * clamped
 
@@ -102,7 +181,6 @@ def clamped_sides(
     nor = normal(domain, s)
     clamped = float(0.0)
 
-    # clamped vertical sides
     clamped = wp.abs(nor[0])
 
     return wp.dot(u(s), v(s)) * clamped
@@ -117,56 +195,11 @@ def boundary_displacement_form(
 ):
     """Prescribed displacement"""
 
-    # opposed to normal
     nor = normal(domain, s)
 
-    # vertical sides only
     clamped = wp.abs(nor[0])
 
     return -displacement * wp.dot(nor, v(s)) * clamped
-
-
-class ClassicFEMWithFloorAndBC(ClassicFEMWithDensity):
-    @staticmethod
-    def add_parser_arguments(parser: argparse.ArgumentParser):
-        ClassicFEM.add_parser_arguments(parser)
-        CollisionHandler.add_parser_arguments(parser)
-
-    def compute_initial_guess(self):
-        self.du_field.dof_values.zero_()
-        self.collision_handler.detect_collisions(self.dt)
-
-    def evaluate_energy(self):
-        E_p, c_r = super().evaluate_energy()
-        E_p = self.collision_handler.add_collision_energy(E_p)
-
-        return E_p, c_r
-
-    def newton_lhs(self):
-        lhs = super().newton_lhs()
-        self.collision_handler.add_collision_hessian(lhs)
-        fem.dirichlet.project_system_matrix(lhs, self.v_bd_matrix)
-
-        return lhs
-
-    def newton_rhs(self, tape=None):
-        rhs = super().newton_rhs(tape)
-        self.collision_handler.add_collision_forces(rhs)
-        self._filter_forces(rhs, tape=tape)
-        return rhs
-
-    def prepare_newton_step(self, tape=None):
-        self.collision_handler.prepare_newton_step(self.dt)
-
-        return super().prepare_newton_step(tape)
-
-    def init_collision_detector(
-        self,
-        vtx_quadrature: fem.PicQuadrature,
-    ):
-        self.collision_handler = CollisionHandler(
-            [], vtx_quadrature.cell_indices, vtx_quadrature.particle_coords, self
-        )
 
 
 if __name__ == "__main__":
@@ -185,7 +218,7 @@ if __name__ == "__main__":
     elif class_args.variant == "trusty":
         sim_class = MFEM_sF_S
     else:
-        sim_class = ClassicFEMWithFloorAndBC
+        sim_class = ClassicFEM
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mesh", type=str, required=True, help="Path to .msh file")
@@ -225,6 +258,7 @@ if __name__ == "__main__":
     )
 
     sim_class.add_parser_arguments(parser)
+    CollisionHandler.add_parser_arguments(parser)
 
     args = parser.parse_args(remaining_args)
     args.ground_height = -1.0
@@ -233,8 +267,11 @@ if __name__ == "__main__":
     args.young_modulus = 10000.0
     args.density = 500.0
     args.poisson_ratio = 0.45
+    args.dt = 0.1
+    args.gravity = 10.0
+    args.cg_tol = 1.0e-8
+    args.cg_iters = 1000
 
-    # Load tetmesh from file
     print(f"Loading mesh from: {args.mesh}")
     msh = meshio.read(args.mesh, file_format="gmsh")
     points_np = msh.points.astype(np.float32)
@@ -258,7 +295,6 @@ if __name__ == "__main__":
 
     print(f"Mesh loaded: {pos.shape[0]} vertices, {tets.shape[0]} tetrahedra")
 
-    # identify cells with > 0 material fraction
     fraction_space = fem.make_polynomial_space(geo, dtype=float, degree=0)
     fraction_test = fem.make_test(fraction_space)
     fraction = fem.integrate(material_fraction_form, fields={"phi": fraction_test})
@@ -266,9 +302,15 @@ if __name__ == "__main__":
     wp.launch(mark_active, dim=fraction.shape, inputs=[fraction, active_cells])
 
     sim = sim_class(geo, active_cells, args)
-    sim.init_displacement_space(None)
+    sim.init_displacement_space()
     sim.init_strain_spaces()
-    sim.init_collision_detector(vtx_quadrature)
+
+    collision_handler = CollisionHandler(
+        kinematic_meshes=[],
+        cp_cell_indices=vtx_quadrature.cell_indices,
+        cp_cell_coords=vtx_quadrature.particle_coords,
+    )
+    sim.add_energy_potential(CollisionPotential(sim, collision_handler))
 
     if args.materials:
         print(f"\n{'='*60}")
@@ -277,19 +319,6 @@ if __name__ == "__main__":
         material_stats = apply_spatially_varying_materials(
             sim, args.materials, k_neighbors=args.k_neighbors
         )
-
-        # spatially varying density at velocity nodes (correct DOF locations)
-        voxel_coords, voxel_materials = load_material_data(args.materials)
-        upsampler = MaterialUpsampler(voxel_coords, voxel_materials)
-        vel_node_pos = sim.u_field.space.node_positions().numpy()
-        mats_u, _ = upsampler.interpolate(vel_node_pos, k=args.k_neighbors)
-        density_u = mats_u[:, 2]
-        if hasattr(sim, "set_density_from_array"):
-            sim.set_density_from_array(density_u)
-            print(
-                f"Assigned spatial density to {density_u.shape[0]} velocity nodes:"
-                f" min={density_u.min():.2f}, max={density_u.max():.2f}"
-            )
     else:
         print(f"\nUsing uniform material properties:")
         print(f"  Young's modulus: {args.young_modulus}")
@@ -311,4 +340,7 @@ if __name__ == "__main__":
         },
     )
 
-    run_softbody_sim(sim, ui=args.ui)
+    if args.ui:
+        _run_with_ground_ui(sim)
+    else:
+        run_softbody_sim(sim, ui=False)

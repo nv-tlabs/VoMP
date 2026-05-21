@@ -16,12 +16,26 @@
 from typing import Any, Tuple
 
 import numpy as np
+
 import warp as wp
 import warp.sparse as sp
-from warp.fem.utils import inverse_qr
-from warp.fem.utils import array_axpy
-
 from warp.examples.fem.utils import bsr_cg
+from warp.fem.utils import array_axpy, inverse_qr
+
+
+try:
+    from warp.fem import (
+        project_system_matrix,
+        project_system_rhs,
+        normalize_dirichlet_projector,
+    )
+except ImportError:
+    from warp.fem.dirichlet import (
+        project_system_matrix,
+        project_system_rhs,
+        normalize_dirichlet_projector,
+    )
+
 
 wp.set_module_options({"enable_backward": False})
 wp.set_module_options({"fast_math": True})
@@ -104,18 +118,14 @@ class MFEMSystem:
         return MFEMSystem(
             sp.bsr_copy(self._A, scalar_type=scalar_type),
             sp.bsr_copy(self._H, scalar_type=scalar_type),
-            (
-                sp.bsr_copy(self._W, scalar_type=scalar_type)
-                if self._W is not None
-                else None
-            ),
+            sp.bsr_copy(self._W, scalar_type=scalar_type)
+            if self._W is not None
+            else None,
             sp.bsr_copy(self._B, scalar_type=scalar_type),
             sp.bsr_copy(self._Cs, scalar_type=scalar_type),
-            (
-                sp.bsr_copy(self._Cr, scalar_type=scalar_type)
-                if self._W is not None
-                else None
-            ),
+            sp.bsr_copy(self._Cr, scalar_type=scalar_type)
+            if self._W is not None
+            else None,
         )
 
     def solve_schur(

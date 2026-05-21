@@ -60,14 +60,13 @@ def load_material_data(npz_path: str):
 
 
 def apply_spatially_varying_materials(sim, npz_path: str, k_neighbors: int = 1):
+
     voxel_coords, voxel_materials = load_material_data(npz_path)
 
-    # Create upsampler
     upsampler = MaterialUpsampler(voxel_coords, voxel_materials)
 
-    # Get vertex positions from the mesh
     node_positions = sim.lame_field.space.node_positions()
-    query_points = node_positions.numpy()  # Convert warp array to numpy
+    query_points = node_positions.numpy()
 
     print(f"\nInterpolating materials to {query_points.shape[0]} mesh vertices...")
 
@@ -75,24 +74,22 @@ def apply_spatially_varying_materials(sim, npz_path: str, k_neighbors: int = 1):
         query_points, k=k_neighbors
     )
 
-    youngs_modulus_per_vertex = interpolated_materials[:, 0]  # (N,) array
-    poisson_ratio_per_vertex = interpolated_materials[:, 1]  # (N,) array
-    density_per_vertex = interpolated_materials[:, 2]  # (N,) array
+    youngs_modulus_per_vertex = interpolated_materials[:, 0]
+    poisson_ratio_per_vertex = interpolated_materials[:, 1]
+    density_per_vertex = interpolated_materials[:, 2]
 
-    # Convert Young's modulus and Poisson's ratio to Lame parameters
-    # lame[0] = lambda = E * nu / ((1 + nu) * (1 - 2*nu))
-    # lame[1] = mu = E / (2 * (1 + nu))
+    # Convert (E, nu) -> (lambda, mu) per vertex
     lame_lambda = (youngs_modulus_per_vertex * poisson_ratio_per_vertex) / (
         (1.0 + poisson_ratio_per_vertex) * (1.0 - 2.0 * poisson_ratio_per_vertex)
     )
     lame_mu = youngs_modulus_per_vertex / (2.0 * (1.0 + poisson_ratio_per_vertex))
 
-    # Stack into (N, 2) array for lame parameters [lambda, mu]
     lame_params = np.stack([lame_lambda, lame_mu], axis=1)
-
-    # Directly set the lame field values (don't use scale_lame_field as it would multiply)
-    # The lame_field.dof_values is a warp array of wp.vec2
     sim.lame_field.dof_values.assign(wp.array(lame_params, dtype=wp.vec2))
+
+    sim.density_field.dof_values.assign(
+        wp.array(density_per_vertex.astype(np.float32), dtype=float)
+    )
 
     return {
         "youngs_modulus": youngs_modulus_per_vertex,
@@ -107,7 +104,6 @@ def visualize_material_distribution(sim, material_stats: dict, output_path: str 
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    # Young's modulus histogram
     axes[0].hist(
         material_stats["youngs_modulus"], bins=50, alpha=0.7, edgecolor="black"
     )
@@ -117,7 +113,6 @@ def visualize_material_distribution(sim, material_stats: dict, output_path: str 
     axes[0].set_yscale("log")
     axes[0].grid(True, alpha=0.3)
 
-    # Poisson's ratio histogram
     axes[1].hist(
         material_stats["poisson_ratio"],
         bins=50,
@@ -130,7 +125,6 @@ def visualize_material_distribution(sim, material_stats: dict, output_path: str 
     axes[1].set_title("Poisson's Ratio Distribution")
     axes[1].grid(True, alpha=0.3)
 
-    # Density histogram
     axes[2].hist(
         material_stats["density"], bins=50, alpha=0.7, edgecolor="black", color="green"
     )

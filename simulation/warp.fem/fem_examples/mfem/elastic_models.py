@@ -13,21 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warp as wp
 import math
+
+import warp as wp
 
 __all__ = [
     "hooke_energy",
-    "hooke_stress",
     "hooke_hessian",
+    "hooke_stress",
     "nh_energy",
-    "nh_stress",
     "nh_hessian_proj",
     "nh_hessian_proj_analytic",
+    "nh_stress",
     "snh_energy",
-    "snh_stress",
     "snh_hessian_proj",
     "snh_hessian_proj_analytic",
+    "snh_stress",
 ]
 
 _SQRT_1_2 = wp.constant(math.sqrt(1.0 / 2.0))
@@ -271,7 +272,7 @@ def _flip_rot_eivec(k: int, sign: float, mat: wp.mat33):
 @wp.func
 def _dJ_dF(F: wp.mat33):
     Ft = wp.transpose(F)
-    return wp.mat33(
+    return wp.matrix_from_cols(
         wp.cross(Ft[1], Ft[2]), wp.cross(Ft[2], Ft[0]), wp.cross(Ft[0], Ft[1])
     )
 
@@ -282,7 +283,7 @@ def _d2J_dF2(F: wp.mat33, sig: wp.mat33, tau: wp.mat33):
     sigt = wp.transpose(sig)
     return wp.ddot(
         tau,
-        wp.mat33(
+        wp.matrix_from_cols(
             wp.cross(Ft[1], sigt[2]) + wp.cross(sigt[1], Ft[2]),
             wp.cross(Ft[2], sigt[0]) + wp.cross(sigt[2], Ft[0]),
             wp.cross(Ft[0], sigt[1]) + wp.cross(sigt[0], Ft[1]),

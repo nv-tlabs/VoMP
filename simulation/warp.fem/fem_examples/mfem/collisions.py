@@ -13,15 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Any
+import argparse
+from typing import Any, List
+from weakref import ReferenceType
+
 import warp as wp
 import warp.fem as fem
 import warp.sparse as sp
-from warp.sim.collide import triangle_closest_point, TRI_CONTACT_FEATURE_FACE_INTERIOR
+from warp.fem.geometry.closest_point import project_on_tri_at_origin
 
-import argparse
-
-from fem_examples.mfem.softbody_sim import SoftbodySim
+from .softbody_sim import DisplacementPotential, SoftbodySim
 
 
 class CollisionHandler:
@@ -81,23 +82,28 @@ class CollisionHandler:
         kinematic_meshes: List[wp.Mesh],
         cp_cell_indices,
         cp_cell_coords,
-        sim: SoftbodySim,
     ):
-        self.args = sim.args
-        self.sim = sim
         self.warp_meshes = kinematic_meshes
+        self.cp_cell_indices = cp_cell_indices
+        self.cp_cell_coords = cp_cell_coords
 
-        n_cp = cp_cell_indices.shape[0]
+        self.collision_quadrature = None
+        self.n_contact = 0
+
+    def init_collision_detector(self, sim: ReferenceType[SoftbodySim]):
+        self.args = sim.args
+        self.sim = sim  # weakref
+
+        n_cp = self.cp_cell_indices.shape[0]
         collision_quadrature = fem.PicQuadrature(
             domain=sim.vel_quadrature.domain,
-            positions=(cp_cell_indices, cp_cell_coords),
+            positions=(self.cp_cell_indices, self.cp_cell_coords),
             measures=wp.ones(n_cp, dtype=float),
         )
         self.set_collision_quadrature(collision_quadrature)
-
         self.n_contact = 0
 
-        max_contacts = 10 * cp_cell_indices.shape[0]
+        max_contacts = 10 * self.cp_cell_indices.shape[0]
         self.collision_indices_a = wp.empty(max_contacts, dtype=int)
         self.collision_indices_b = wp.empty(max_contacts, dtype=int)
         self.collision_normals = wp.empty(max_contacts, dtype=wp.vec3)
@@ -113,14 +119,12 @@ class CollisionHandler:
         self._HtH_work_arrays = sp.bsr_mm_work_arrays()
         self._HbHa_work_arrays = sp.bsr_axpy_work_arrays()
 
-        self._collision_stiffness = (
-            self.args.collision_stiffness * self.args.density / n_cp
-        )
+        self._collision_stiffness = self.args.collision_stiffness * self.args.density / n_cp
 
     def set_collision_quadrature(self, quadrature: fem.PicQuadrature):
         self.collision_quadrature = quadrature
 
-    def add_collision_energy(self, E: float):
+    def add_collision_energy(self, E: wp.array):
         if self.n_contact == 0:
             return E
 
@@ -142,7 +146,12 @@ class CollisionHandler:
                 col_energies,
             ],
         )
-        return E + self._collision_stiffness * wp.utils.array_sum(col_energies)
+        Ec = wp.empty_like(E)
+        wp.utils.array_sum(col_energies, out=Ec)
+
+        fem.utils.array_axpy(x=Ec, y=E, alpha=self._collision_stiffness, beta=1.0)
+
+        return E
 
     def add_collision_hessian(self, lhs: wp.array):
         # contacts
@@ -214,6 +223,14 @@ class CollisionHandler:
 
     def cp_world_position(self, dest=None):
         cp_pic = self.collision_quadrature
+
+        if cp_pic is None:
+            if dest is None:
+                dest = wp.array([], dtype=wp.vec3)
+            else:
+                dest.assign([])
+            return dest
+
         if dest is None:
             dest = wp.empty(cp_pic.total_point_count(), dtype=wp.vec3)
         fem.interpolate(
@@ -276,9 +293,7 @@ class CollisionHandler:
         cp_cur_pos = self.cp_world_position()
         cp_du = self._sample_cp_displacement(self.sim.du_field)
 
-        collision_radius = (
-            self.args.collision_radius * self.args.collision_detection_ratio
-        )
+        collision_radius = self.args.collision_radius * self.args.collision_detection_ratio
 
         if self.args.ground:
             ground_height = self.args.ground_height
@@ -319,15 +334,8 @@ class CollisionHandler:
                 ],
             )
 
-    def build_collision_jacobian(self):
+    def build_collision_quadratures(self):
         n_contact = self.n_contact
-
-        # Build collision jacobian
-        # (derivative of collision gap `pos_a - pos_b` w.r.t. degrees of freedom)
-
-        if n_contact == 0:
-            return
-
         a_cells = wp.empty(n_contact, dtype=int)
         a_coords = wp.empty(n_contact, dtype=wp.vec3)
         b_cells = wp.empty(n_contact, dtype=int)
@@ -367,9 +375,21 @@ class CollisionHandler:
             positions=(b_cells, b_coords),
             measures=measures,
         )
-        u_trial = fem.make_trial(
-            self.sim.u_field.space, space_partition=self.sim.u_field.space_partition
-        )
+
+        return a_contact_pic, b_contact_pic
+
+    def build_collision_jacobian(self):
+        n_contact = self.n_contact
+
+        # Build collision jacobian
+        # (derivative of collision gap `pos_a - pos_b` w.r.t. degrees of freedom)
+
+        if n_contact == 0:
+            return
+
+        a_contact_pic, b_contact_pic = self.build_collision_quadratures()
+
+        u_trial = fem.make_trial(self.sim.u_field.space, space_partition=self.sim.u_field.space_partition)
 
         sp.bsr_set_zero(
             self._collision_jacobian_a,
@@ -380,7 +400,7 @@ class CollisionHandler:
             u_trial,
             quadrature=a_contact_pic,
             dest=self._collision_jacobian_a,
-            bsr_options={"prune_numerical_zeros": False},
+            kernel_options={"enable_backward": False},
         )
 
         sp.bsr_set_zero(
@@ -392,7 +412,7 @@ class CollisionHandler:
             u_trial,
             quadrature=b_contact_pic,
             dest=self._collision_jacobian_b,
-            bsr_options={"prune_numerical_zeros": False},
+            kernel_options={"enable_backward": False},
         )
 
         self._collision_jacobian_a.nnz_sync()
@@ -407,9 +427,7 @@ class CollisionHandler:
             work_arrays=self._HbHa_work_arrays,
         )
 
-        sp.bsr_set_transpose(
-            dest=self._collision_jacobian_t, src=self._collision_jacobian
-        )
+        sp.bsr_set_transpose(dest=self._collision_jacobian_t, src=self._collision_jacobian)
 
 
 class MeshSelfCollisionHandler(CollisionHandler):
@@ -417,11 +435,8 @@ class MeshSelfCollisionHandler(CollisionHandler):
         self,
         vtx_quadrature: fem.PicQuadrature,
         tri_mesh: wp.Mesh,
-        sim: SoftbodySim,
     ):
-        super().__init__(
-            [], vtx_quadrature.cell_indices, vtx_quadrature.particle_coords, sim
-        )
+        super().__init__([], vtx_quadrature.cell_indices, vtx_quadrature.particle_coords)
 
         self.tri_vtx_quadrature = vtx_quadrature
         self.vtx_rest_pos = wp.clone(tri_mesh.points)
@@ -465,9 +480,7 @@ class MeshSelfCollisionHandler(CollisionHandler):
         n_cp = cp_du.shape[0]
         max_contacts = self.collision_normals.shape[0]
 
-        collision_radius = (
-            self.args.collision_radius * self.args.collision_detection_ratio
-        )
+        collision_radius = self.args.collision_radius * self.args.collision_detection_ratio
 
         start_contacts = count.numpy()[0]
         pos_b = wp.empty(indices_b.shape, dtype=wp.vec3)
@@ -505,6 +518,30 @@ class MeshSelfCollisionHandler(CollisionHandler):
                 max_dist=self.sim.typical_length,
             )
             self.set_collision_quadrature(quadrature)
+
+
+class CollisionPotential(DisplacementPotential):
+    def __init__(self, sim: SoftbodySim, collision_handler: CollisionHandler):
+        super().__init__(sim)
+        self.collision_handler = collision_handler
+
+    def prepare_frame(self, dt):
+        self.collision_handler.detect_collisions(dt)
+
+    def add_energy(self, E_u):
+        self.collision_handler.add_collision_energy(E_u)
+
+    def add_hessian(self, lhs: sp.BsrMatrix):
+        self.collision_handler.add_collision_hessian(lhs)
+
+    def add_forces(self, rhs: wp.array, tape: wp.Tape = None):
+        self.collision_handler.add_collision_forces(rhs)
+
+    def prepare_newton_step(self, dt, tape=None):
+        self.collision_handler.prepare_newton_step(dt)
+
+    def init_constant_forms(self):
+        self.collision_handler.init_collision_detector(self.sim)
 
 
 @wp.kernel
@@ -641,10 +678,12 @@ def detect_mesh_self_collisions(
         u2 = mesh.points[t1]
         u3 = mesh.points[t2]
 
-        cp, bary, feature_type = triangle_closest_point(u1, u2, u3, x)
-        if feature_type != TRI_CONTACT_FEATURE_FACE_INTERIOR:
+        d, bary = project_on_tri_at_origin(x - u1, u2 - u1, u3 - u1)
+        if wp.max(bary) >= 1.0 or wp.min(bary) <= 0.0:
+            # point not in interior, ignore
             continue
 
+        cp = bary[0] * u1 + bary[1] * u2 + bary[2] * u3
         delta = x - cp
 
         face_nor = wp.mesh_eval_face_normal(mesh_id, face_index)
@@ -806,12 +845,7 @@ def collision_gradient_and_hessian(
 
     vt_perp = wp.cross(vt_dir, nor)
     hessian[c] += (
-        mu_fn
-        / dt
-        * (
-            (df1_d_vtn + nu) * wp.outer(vt_dir, vt_dir)
-            + (f1_over_vt_norm + nu) * wp.outer(vt_perp, vt_perp)
-        )
+        mu_fn / dt * ((df1_d_vtn + nu) * wp.outer(vt_dir, vt_dir) + (f1_over_vt_norm + nu) * wp.outer(vt_perp, vt_perp))
     )
 
 
