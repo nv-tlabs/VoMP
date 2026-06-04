@@ -21,13 +21,16 @@ and material property upsampling capabilities.
 """
 
 import os
+import shutil
 from typing import Optional, Union, Tuple, Dict, Any
 
-import torch
+import kaolin.io.usd as kio
 import numpy as np
+import torch
 import trimesh
-from torchvision import transforms
+from kaolin.physics.simplicits import PhysicsPoints
 from scipy.spatial import cKDTree
+from torchvision import transforms
 
 
 class LazyLoadDino:
@@ -386,10 +389,112 @@ class MaterialUpsampler:
         }
 
 
+def save_materials_usd(
+    materials_dict: Dict[str, np.ndarray],
+    output_path: str,
+    input_usd_path: Optional[str] = None,
+    scene_path: Optional[str] = None,
+    material_name: str = "default",
+    appx_vol: Optional[float] = None,
+) -> None:
+    """
+    Save materials to USD via kaolin's ``add_physics_material`` writer.
+
+    If ``input_usd_path`` (or ``materials_dict['source_usd_path']``, as set by
+    ``Vomp.get_usd_materials``) is provided, copy that USD to ``output_path``
+    and attach the predicted physics material to ``scene_path``. Otherwise
+    create a new USD at ``output_path`` with the predicted points as a
+    ``UsdGeomPoints`` prim and attach the physics material to it.
+
+    Args:
+        materials_dict: Dictionary containing material properties with keys:
+            - 'youngs_modulus', 'poisson_ratio', 'density'
+            - 'query_coords_world' or 'voxel_coords_world'
+            - (optional) 'source_usd_path'
+        output_path: Output USD file path ('.usd' / '.usda' / '.usdc').
+        input_usd_path: Existing USD to copy and attach to.
+        scene_path: Sdf.Path that should receive the material. Defaults to
+            '/World/Points/vomp_points' in standalone mode, or the first Mesh /
+            UsdGeomPoints / PointInstancer / Gaussian prim in attach mode.
+        material_name: Namespace passed to ``add_physics_material``.
+        appx_vol: Approximate object volume in m^3. Defaults to the
+            bounding-box volume of the predicted points.
+    """
+    if input_usd_path is None:
+        input_usd_path = materials_dict.get("source_usd_path")
+
+    if "query_coords_world" in materials_dict:
+        coords_key = "query_coords_world"
+    elif "voxel_coords_world" in materials_dict:
+        coords_key = "voxel_coords_world"
+    else:
+        raise ValueError(
+            "No coordinate data found. Expected 'query_coords_world' or 'voxel_coords_world'"
+        )
+
+    pts = torch.as_tensor(materials_dict[coords_key], dtype=torch.float32)
+    yms = torch.as_tensor(
+        materials_dict["youngs_modulus"], dtype=torch.float32
+    ).reshape(-1)
+    prs = torch.as_tensor(materials_dict["poisson_ratio"], dtype=torch.float32).reshape(
+        -1
+    )
+    rhos = torch.as_tensor(materials_dict["density"], dtype=torch.float32).reshape(-1)
+
+    if appx_vol is None:
+        appx_vol = float((pts.amax(0) - pts.amin(0)).prod().clamp(min=1e-6))
+
+    physics_points = PhysicsPoints(
+        pts=pts, yms=yms, prs=prs, rhos=rhos, appx_vol=appx_vol
+    )
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    if input_usd_path is not None:
+        if os.path.abspath(input_usd_path) != os.path.abspath(output_path):
+            shutil.copyfile(input_usd_path, output_path)
+        if scene_path is None:
+            for finder in (
+                kio.get_mesh_scene_paths,
+                kio.get_pointcloud_scene_paths,
+                kio.get_gaussiancloud_scene_paths,
+            ):
+                paths = finder(output_path)
+                if paths:
+                    scene_path = str(paths[0])
+                    break
+            else:
+                raise ValueError(
+                    f"Could not auto-detect a prim in '{output_path}' to attach to; "
+                    f"pass scene_path='/World/...' explicitly."
+                )
+    else:
+        if scene_path is None:
+            scene_path = "/World/Points/vomp_points"
+        kio.export_pointcloud(
+            output_path,
+            pts,
+            scene_path=scene_path,
+            points_type="usd_geom_points",
+            overwrite=True,
+        )
+
+    kio.add_physics_material(
+        output_path,
+        scene_path,
+        physics_points=physics_points,
+        material_name=material_name,
+        overwrite=True,
+    )
+
+
 def save_materials(
     materials_dict: Dict[str, np.ndarray],
     output_path: str,
     format: str = "npz",
+    **usd_kwargs: Any,
 ) -> None:
     """
     Save materials to file in specified format.
@@ -403,8 +508,12 @@ def save_materials(
             - 'poisson_ratio': Poisson's ratio values
             - 'density': Density values
             - Coordinates: Either 'voxel_coords_world' or 'splat_coords_world'
-        output_path: Output file path
-        format: File format ("npz" or "pth")
+        output_path: Output file path.
+        format: File format ('npz', 'pth', or 'usd'). Auto-detected as 'usd'
+            when output_path ends in '.usd' / '.usda' / '.usdc'.
+        **usd_kwargs: Extra keyword arguments forwarded to save_materials_usd
+            when writing USD (e.g. input_usd_path, scene_path, material_name,
+            appx_vol).
 
     Raises:
         ValueError: If no material data found or unsupported format
@@ -413,13 +522,32 @@ def save_materials(
         >>> from vomp.inference.utils import save_materials
         >>> save_materials(results, "materials.npz")
         >>> save_materials(results, "materials.pth", format="pth")
+        >>> save_materials(results, "materials.usda")
+        >>> save_materials(results, "model_with_vomp.usda", input_usd_path="model.usd")
     """
+    fmt = format.lower()
+    if output_path.lower().endswith((".usd", ".usda", ".usdc")):
+        fmt = "usd"
+    elif output_path.lower().endswith((".npz")):
+        fmt = "npz"
+    elif output_path.lower().endswith((".pth")):
+        fmt = "pth"
+    else:
+        raise ValueError(
+            f"Unsupported format: {format}. Use 'npz', 'pth', 'usd', 'usda', 'usdc'"
+        )
+
+    if fmt == "usd":
+        save_materials_usd(materials_dict, output_path, **usd_kwargs)
+        print(f"Saved materials to: {output_path}")
+        return
+
     os.makedirs(
         os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
         exist_ok=True,
     )
 
-    if format.lower() == "npz":
+    if fmt == "npz":
         # Save as compressed numpy archive
         if "voxel_data" in materials_dict:
             # Already in structured array format
@@ -471,7 +599,7 @@ def save_materials(
 
             np.savez_compressed(output_path, voxel_data=voxel_data)
 
-    elif format.lower() == "pth":
+    elif fmt == "pth":
         # Save as PyTorch tensors
         torch_dict = {}
         for key, value in materials_dict.items():
@@ -482,7 +610,9 @@ def save_materials(
         torch.save(torch_dict, output_path)
 
     else:
-        raise ValueError(f"Unsupported format: {format}. Use 'npz' or 'pth'")
+        raise ValueError(
+            f"Unsupported format: {format}. Use 'npz', 'pth', 'usd', 'usda', 'usdc'"
+        )
 
     print(f"Saved materials to: {output_path}")
 

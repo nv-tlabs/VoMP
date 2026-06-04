@@ -194,7 +194,7 @@ if ask_yes_no "Install/reinstall Kaolin 0.18.0? (Skip if already installed with 
   echo -e "${GREEN}...Installing Kaolin${NOCOLOR}"
   # Extract CUDA version digits (e.g., 11.8.0 -> 118, 12.0.1 -> 120)
   KAOLIN_CUDA_VER=$(echo "$CUDA_VERSION" | awk -F. '{printf "%s%s", $1, $2}')
-  pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu"${KAOLIN_CUDA_VER}".html || { echo -e "${RED}Failed to install Kaolin${NOCOLOR}"; exit 1; }
+  pip install kaolin==0.19.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu"${KAOLIN_CUDA_VER}".html || { echo -e "${RED}Failed to install Kaolin${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}...Skipping Kaolin installation${NOCOLOR}"
 fi

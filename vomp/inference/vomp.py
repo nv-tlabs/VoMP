@@ -3426,6 +3426,7 @@ class Vomp(nn.Module):
                     **kwargs,
                 )
 
+                results["source_usd_path"] = usd_path
                 return results
 
             finally:
@@ -3570,5 +3571,6 @@ class Vomp(nn.Module):
                     f"Invalid query_points value: {query_points}. Must be 'voxel_centers', None, or numpy array."
                 )
 
+            results["source_usd_path"] = usd_path
             print("✓ Material estimation complete!")
             return results
