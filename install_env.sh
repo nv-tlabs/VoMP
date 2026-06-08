@@ -7,7 +7,7 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
 CONDA_ENV=${1:-"vomp"}
-CUDA_VERSION=${CUDA_VERSION:-"11.8.0"}
+CUDA_VERSION=${CUDA_VERSION:-"12.4.0"}
 
 export CLI_COLOR=1
 RED='\033[1;31m'
@@ -142,18 +142,18 @@ if ask_yes_no "Install/reinstall torch-tensorrt? (Skip if already installed)"; t
   if [ "$CUDA_VERSION" == "11.8.0" ]; then
     pip install -U torch-tensorrt==2.4.0 --no-deps --index-url https://download.pytorch.org/whl/cu118 || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
   else
-    pip install -U torch-tensorrt==2.4.0 --no-deps || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
+    pip install -U torch-tensorrt==2.6.0 --no-deps --index-url https://download.pytorch.org/whl/cu124 || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
   fi
 else
   echo -e "${RED}...Skipping torch-tensorrt installation${NOCOLOR}"
 fi
 
-if ask_yes_no "Install/reinstall PyTorch 2.4.0 and related packages? (Skip if already installed with correct version)"; then
+if ask_yes_no "Install/reinstall PyTorch 2.6.0 and related packages? (Skip if already installed with correct version)"; then
   echo -e "${GREEN}...Installing PyTorch${NOCOLOR}"
   if [ "$CUDA_VERSION" == "11.8.0" ]; then
     pip install torch==2.4.0 torchvision==0.19.0 xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu118 || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
   else
-    pip install torch==2.4.0 torchvision==0.19.0 xformers==0.0.27.post2 || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
+    pip install torch==2.6.0 torchvision==0.21.0 xformers==0.0.29.post3 --index-url https://download.pytorch.org/whl/cu124 || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
   fi
 else
   echo -e "${RED}...Skipping PyTorch installation${NOCOLOR}"
@@ -170,10 +170,18 @@ fi
 echo -e "${GREEN}...Installing flash_attn${NOCOLOR}"
 if ask_yes_no "Install prebuilt flash_attn binary (faster) instead of building from source?"; then
   echo -e "${GREEN}Installing prebuilt flash_attn binary${NOCOLOR}"
-  pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl --no-build-isolation || { echo -e "${RED}Failed to install prebuilt flash_attn${NOCOLOR}"; exit 1; }
+  if [ "$CUDA_VERSION" == "11.8.0" ]; then
+    pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl --no-build-isolation || { echo -e "${RED}Failed to install prebuilt flash_attn${NOCOLOR}"; exit 1; }
+  else
+    pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl --no-build-isolation || { echo -e "${RED}Failed to install prebuilt flash_attn${NOCOLOR}"; exit 1; }
+  fi
 else
   echo -e "${GREEN}Building flash_attn from source${NOCOLOR}"
-  pip install flash_attn==2.5.9.post1 --no-build-isolation || { echo -e "${RED}Failed to build flash_attn from source${NOCOLOR}"; exit 1; }
+  if [ "$CUDA_VERSION" == "11.8.0" ]; then
+    pip install flash_attn==2.5.9.post1 --no-build-isolation || { echo -e "${RED}Failed to build flash_attn from source${NOCOLOR}"; exit 1; }
+  else
+    pip install flash_attn==2.7.4.post1 --no-build-isolation || { echo -e "${RED}Failed to build flash_attn from source${NOCOLOR}"; exit 1; }
+  fi
 fi
 
 if ask_yes_no "Install/reinstall spconv? (Skip if already installed with correct CUDA version)"; then
