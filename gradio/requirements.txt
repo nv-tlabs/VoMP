@@ -20,4 +20,4 @@ git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3
 https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 spconv-cu120
 --find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
-kaolin==0.19.0
+kaolin==0.18.0
