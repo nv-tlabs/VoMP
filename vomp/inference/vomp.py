@@ -63,6 +63,7 @@ from vomp.inference.utils import (
 from vomp.representations.gaussian import Gaussian
 from vomp.inference.replicator_renderer import render_with_replicator
 from vomp.inference.usd_utils import convert_usd_to_obj
+from vomp.inference.utils import load_gaussian_usd
 import tempfile
 import shutil
 import multiprocessing
@@ -3574,3 +3575,91 @@ class Vomp(nn.Module):
             results["source_usd_path"] = usd_path
             print("✓ Material estimation complete!")
             return results
+
+    @torch.no_grad()
+    def get_gaussian_usd_materials(
+        self,
+        usd_path: str,
+        segment: Optional[str] = None,
+        indices: Optional[np.ndarray] = None,
+        scene_path: Optional[str] = None,
+        normalize: bool = True,
+        return_original_scale: bool = True,
+        output_dir: Optional[str] = None,
+        query_points: Union[str, np.ndarray, None] = "splat_centers",
+        seed: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Dict[str, np.ndarray]:
+        """
+        High-level API for material inference on a Gaussian-splat USD.
+
+        Args:
+            usd_path: Path to the Gaussian-splat USD (.usd / .usda / .usdc).
+            segment: Name of a `GeomSubset` segment to evaluate (see
+                `vomp.inference.utils.get_gaussian_usd_segments`). If None and
+                `indices` is None, the whole cloud is used.
+            indices: Explicit point indices to evaluate (mutually exclusive with
+                `segment`).
+            scene_path: Scene path of the Gaussian prim. Defaults to the first
+                `ParticleField3DGaussianSplat` prim in the stage.
+            normalize: Recenter/rescale the splats into VoMP's canonical cube before
+                inference.
+            return_original_scale: If True, map predicted coordinates back
+                to the original USD world frame using the load-time normalization.
+            output_dir: Directory for intermediate render/voxel/feature files.
+            query_points: Where to evaluate materials; see `get_splat_materials`.
+            seed: Random seed for camera-view sampling.
+            **kwargs: Forwarded to `get_splat_materials`.
+
+        Returns:
+            Dictionary of material properties (see `get_splat_materials`), plus:
+            - 'source_usd_path', 'scene_path': for writing materials back to the USD.
+            - 'segment', 'segment_indices': the evaluated segment and its point indices.
+            - 'transform_center', 'transform_scale': normalization used (if applied).
+
+        Example:
+            >>> model = Vomp.from_checkpoint("weights/inference.json")
+            >>> res = model.get_gaussian_usd_materials("tools.usd", segment="drill", seed=42)
+            >>> save_materials(res, "tools_vomp.usd", material_name="drill")
+        """
+
+        gaussian, meta = load_gaussian_usd(
+            usd_path,
+            scene_path=scene_path,
+            segment=segment,
+            indices=indices,
+            normalize=normalize,
+            device=self.device,
+        )
+
+        if output_dir is None:
+            asset = os.path.splitext(os.path.basename(usd_path))[0]
+            output_dir = f"/tmp/Vomp_gusd_{asset}_{segment or 'all'}"
+
+        print(
+            f"=== Vomp: Gaussian USD Material Estimation "
+            f"(segment={segment or 'all'}, {meta['num_gaussians']:,} splats) ==="
+        )
+        results = self.get_splat_materials(
+            gaussian,
+            output_dir=output_dir,
+            query_points=query_points,
+            seed=seed,
+            **kwargs,
+        )
+
+        if normalize and return_original_scale:
+            center, scale = meta["center"], meta["scale"]
+            for key in ("query_coords_world", "voxel_coords_world"):
+                if results.get(key) is not None:
+                    results[key] = denormalize_coords(
+                        np.asarray(results[key]), center, scale
+                    )
+            results["transform_center"] = center
+            results["transform_scale"] = scale
+
+        results["source_usd_path"] = usd_path
+        results["scene_path"] = meta["scene_path"]
+        results["segment"] = segment
+        results["segment_indices"] = meta["indices"]
+        return results

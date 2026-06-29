@@ -31,6 +31,8 @@ import trimesh
 from kaolin.physics.simplicits import PhysicsPoints
 from scipy.spatial import cKDTree
 from torchvision import transforms
+from pxr import Usd, UsdGeom
+from vomp.representations.gaussian import Gaussian
 
 
 class LazyLoadDino:
@@ -733,3 +735,148 @@ def denormalize_coords(
         Denormalized coordinates (N, 3) in original scale
     """
     return coords * scale + center
+
+
+def get_gaussian_usd_segments(
+    usd_path: str, scene_path: Optional[str] = None
+) -> Dict[str, np.ndarray]:
+    """
+    List the `GeomSubset` segments defined on a Gaussian-splat USD prim.
+
+    Args:
+        usd_path: Path to the USD file (.usd / .usda / .usdc).
+        scene_path: Scene path of the Gaussian prim. If None, the first
+            `ParticleField3DGaussianSplat` prim in the stage is used.
+
+    Returns:
+        Dict mapping each segment name to an int64 array of point indices into the
+        Gaussian cloud. Empty dict if the prim has no point `GeomSubset` children.
+    """
+
+    stage = Usd.Stage.Open(usd_path)
+    if scene_path is None:
+        paths = kio.get_gaussiancloud_scene_paths(stage)
+        if not paths:
+            raise ValueError(f"No Gaussian cloud prim found in '{usd_path}'")
+        scene_path = str(paths[0])
+
+    prim = stage.GetPrimAtPath(scene_path)
+    segments: Dict[str, np.ndarray] = {}
+    for child in prim.GetChildren():
+        if child.GetTypeName() != "GeomSubset":
+            continue
+        subset = UsdGeom.Subset(child)
+        if subset.GetElementTypeAttr().Get() != "point":
+            continue
+        indices = subset.GetIndicesAttr().Get()
+        if indices is None:
+            continue
+        segments[child.GetName()] = np.asarray(indices, dtype=np.int64)
+    return segments
+
+
+def load_gaussian_usd(
+    usd_path: str,
+    scene_path: Optional[str] = None,
+    segment: Optional[str] = None,
+    indices: Optional[np.ndarray] = None,
+    normalize: bool = True,
+    aabb: Optional[list] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> Tuple["Gaussian", Dict[str, Any]]:
+    """
+    Load a Gaussian-splat USD into a VoMP `Gaussian`, ready for inference.
+
+    Args:
+        usd_path: Path to the Gaussian-splat USD (.usd / .usda / .usdc).
+        scene_path: Scene path of the Gaussian prim. If None, the first
+            `ParticleField3DGaussianSplat` prim is used.
+        segment: Name of a `GeomSubset` segment to load (see
+            `get_gaussian_usd_segments`). Mutually exclusive with `indices`.
+        indices: Explicit point indices to load. Mutually exclusive with `segment`.
+        normalize: If True, recenter/rescale splats into `[-0.5, 0.5]`.
+        aabb: Gaussian AABB `[min_xyz, size_xyz]`. Defaults to `[-1,-1,-1,2,2,2]`.
+        device: Compute device. Defaults to CUDA if available.
+
+    Returns:
+        Tuple of:
+            - Gaussian: the loaded VoMP Gaussian.
+            - meta (dict): `source_usd_path`, `scene_path`, `segment`,
+              `indices`, `center` (np.ndarray, 3), `scale` (float),
+              `num_gaussians` (int). For `normalize=False`, center is zeros and scale is 1.0.
+    """
+
+    if segment is not None and indices is not None:
+        raise ValueError("Pass only one of 'segment' or 'indices', not both.")
+    if aabb is None:
+        aabb = [-1, -1, -1, 2, 2, 2]
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if scene_path is None:
+        paths = kio.get_gaussiancloud_scene_paths(usd_path)
+        if not paths:
+            raise ValueError(f"No Gaussian cloud prim found in '{usd_path}'")
+        scene_path = str(paths[0])
+
+    # import only the selected prim
+    gsm = kio.import_gaussiancloud(usd_path, root_path=scene_path).to(device)
+
+    if segment is not None:
+        seg_map = get_gaussian_usd_segments(usd_path, scene_path=scene_path)
+        if segment not in seg_map:
+            raise ValueError(
+                f"Segment '{segment}' not found. Available: {sorted(seg_map)}"
+            )
+        indices = seg_map[segment]
+
+    if indices is not None:
+        idx = torch.as_tensor(np.asarray(indices), dtype=torch.long, device=device)
+        positions = gsm.positions[idx]
+        scales = gsm.scales[idx]
+        orientations = gsm.orientations[idx]
+        opacities = gsm.opacities[idx]
+        sh_coeff = gsm.sh_coeff[idx]
+        indices = np.asarray(indices, dtype=np.int64)
+    else:
+        positions = gsm.positions
+        scales = gsm.scales
+        orientations = gsm.orientations
+        opacities = gsm.opacities
+        sh_coeff = gsm.sh_coeff
+
+    positions = positions.float()
+    if normalize:
+        center_t = (positions.amin(0) + positions.amax(0)) / 2.0
+        scale = float((positions.amax(0) - positions.amin(0)).max().clamp(min=1e-8))
+        positions = (positions - center_t) / scale
+        scales = scales.float() / scale
+        center = center_t.detach().cpu().numpy()
+    else:
+        center = np.zeros(3, dtype=np.float32)
+        scale = 1.0
+        scales = scales.float()
+
+    sh_degree = int(gsm.sh_degree)
+    gaussian = Gaussian(aabb=aabb, sh_degree=sh_degree, device=device)
+    gaussian.from_xyz(positions)
+    gaussian.from_scaling(scales)
+    gaussian.from_rotation(orientations.float())
+    gaussian.from_opacity(opacities.float().reshape(-1, 1))
+
+    # sh_coeff is (N, S, 3)
+    gaussian._features_dc = sh_coeff[:, :1, :].contiguous().float()
+    gaussian._features_rest = (
+        sh_coeff[:, 1:, :].contiguous().float() if sh_degree > 0 else None
+    )
+
+    meta = {
+        "source_usd_path": usd_path,
+        "scene_path": scene_path,
+        "segment": segment,
+        "indices": indices,
+        "center": center,
+        "scale": scale,
+        "num_gaussians": int(positions.shape[0]),
+    }
+    return gaussian, meta
