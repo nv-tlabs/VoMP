@@ -2093,6 +2093,12 @@ class Vomp(nn.Module):
         print(f"Using Kaolin voxelization with {xyz.shape[0]} Gaussians...")
         print(f"Resolution: {2**level}^3, opacity_threshold: {opacity_threshold}")
 
+        # gs_to_voxelgrid builds a kaolin SPC, which is defined on the [-1, 1] cube.
+        # The gaussian is normalized to [-0.5, 0.5], so scale positions (and the
+        # gaussian scales) by 2 to fill the full 2^level grid.
+        xyz = xyz * 2
+        scales = scales * 2
+
         # Use Kaolin's Gaussian to voxel grid conversion
         voxel_coords, voxel_opacities = gs_ops.gs_to_voxelgrid(
             xyz, scales, rots, opacities, level=level, iso=iso, tol=tol, step=step
