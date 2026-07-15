@@ -1456,6 +1456,7 @@ class Vomp(nn.Module):
         max_voxels: Optional[int] = 32768,
         query_points: Union[str, np.ndarray, None] = "splat_centers",
         dino_batch_size: int = 16,
+        return_original_scale: bool = True,
         **kwargs: Any,
     ) -> Dict[str, np.ndarray]:
         """
@@ -1572,6 +1573,12 @@ class Vomp(nn.Module):
 
         # Step 1: Extract features using built-in splat functions
         print("Step 1: Extracting features...")
+
+        _xyz0 = gaussian_model.get_xyz
+        _mn = _xyz0.min(dim=0)[0]
+        _mx = _xyz0.max(dim=0)[0]
+        _norm_center = ((_mn + _mx) / 2.0).detach().cpu().numpy()
+        _norm_scale = float((_mx - _mn).max().clamp(min=1e-8) / 0.98)
 
         # Normalize Gaussian to standard coordinate system
         gaussian_model = self._normalize_gaussian(gaussian_model)
@@ -1698,8 +1705,18 @@ class Vomp(nn.Module):
                 f"Invalid query_points value: {query_points}. Must be 'splat_centers', 'voxel_centers', None, or numpy array."
             )
 
+        if return_original_scale:
+            for _k in ("query_coords_world", "voxel_coords_world"):
+                if results.get(_k) is not None:
+                    results[_k] = denormalize_coords(
+                        np.asarray(results[_k], dtype=np.float64), _norm_center, _norm_scale
+                    )
+            results["transform_center"] = _norm_center
+            results["transform_scale"] = _norm_scale
+
         print("✓ Material estimation complete!")
         return results
+
 
     @torch.inference_mode()
     def get_custom_materials(
