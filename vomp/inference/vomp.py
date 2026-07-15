@@ -2037,9 +2037,9 @@ class Vomp(nn.Module):
         voxel_indices = ((centers + 0.5) * 64).astype(np.int32)
         voxel_indices = np.clip(voxel_indices, 0, 63)
 
-        # Unique voxel indices, then convert back to world-space voxel centers
+        # Unique voxel indices, then convert back to world-space voxel centers.
         unique_indices = np.unique(voxel_indices, axis=0)
-        voxel_centers = unique_indices.astype(np.float32) / 64.0 - 0.5
+        voxel_centers = (unique_indices.astype(np.float32) + 0.5) / 64.0 - 0.5
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
@@ -2116,10 +2116,9 @@ class Vomp(nn.Module):
             )
             return np.empty((0, 3), dtype=np.float32)
 
-        # Convert voxel coordinates to world space centers
-        # Kaolin returns integer voxel coordinates, convert to world space [-0.5, 0.5]
+        # Convert voxel coordinates to world space centers.
         voxel_coords_cpu = voxel_coords.cpu().numpy()
-        voxel_centers = voxel_coords_cpu.astype(np.float32) / (2**level) - 0.5
+        voxel_centers = (voxel_coords_cpu.astype(np.float32) + 0.5) / (2**level) - 0.5
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
