@@ -1457,6 +1457,7 @@ class Vomp(nn.Module):
         max_voxels: Optional[int] = 32768,
         query_points: Union[str, np.ndarray, None] = "splat_centers",
         dino_batch_size: int = 16,
+        return_original_scale: bool = True,
         **kwargs: Any,
     ) -> Dict[str, np.ndarray]:
         """
@@ -1573,6 +1574,12 @@ class Vomp(nn.Module):
 
         # Step 1: Extract features using built-in splat functions
         print("Step 1: Extracting features...")
+
+        _xyz0 = gaussian_model.get_xyz
+        _mn = _xyz0.min(dim=0)[0]
+        _mx = _xyz0.max(dim=0)[0]
+        _norm_center = ((_mn + _mx) / 2.0).detach().cpu().numpy()
+        _norm_scale = float((_mx - _mn).max().clamp(min=1e-8) / 0.98)
 
         # Normalize Gaussian to standard coordinate system
         gaussian_model = self._normalize_gaussian(gaussian_model)
@@ -1699,8 +1706,18 @@ class Vomp(nn.Module):
                 f"Invalid query_points value: {query_points}. Must be 'splat_centers', 'voxel_centers', None, or numpy array."
             )
 
+        if return_original_scale:
+            for _k in ("query_coords_world", "voxel_coords_world"):
+                if results.get(_k) is not None:
+                    results[_k] = denormalize_coords(
+                        np.asarray(results[_k], dtype=np.float64), _norm_center, _norm_scale
+                    )
+            results["transform_center"] = _norm_center
+            results["transform_scale"] = _norm_scale
+
         print("✓ Material estimation complete!")
         return results
+
 
     @torch.inference_mode()
     def get_custom_materials(
@@ -2021,9 +2038,9 @@ class Vomp(nn.Module):
         voxel_indices = ((centers + 0.5) * 64).astype(np.int32)
         voxel_indices = np.clip(voxel_indices, 0, 63)
 
-        # Unique voxel indices, then convert back to world-space voxel centers
+        # Unique voxel indices, then convert back to world-space voxel centers.
         unique_indices = np.unique(voxel_indices, axis=0)
-        voxel_centers = unique_indices.astype(np.float32) / 64.0 - 0.5
+        voxel_centers = (unique_indices.astype(np.float32) + 0.5) / 64.0 - 0.5
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
@@ -2077,6 +2094,12 @@ class Vomp(nn.Module):
         print(f"Using Kaolin voxelization with {xyz.shape[0]} Gaussians...")
         print(f"Resolution: {2**level}^3, opacity_threshold: {opacity_threshold}")
 
+        # gs_to_voxelgrid builds a kaolin SPC, which is defined on the [-1, 1] cube.
+        # The gaussian is normalized to [-0.5, 0.5], so scale positions (and the
+        # gaussian scales) by 2 to fill the full 2^level grid.
+        xyz = xyz * 2
+        scales = scales * 2
+
         # Use Kaolin's Gaussian to voxel grid conversion
         voxel_coords, voxel_opacities = gs_ops.gs_to_voxelgrid(
             xyz, scales, rots, opacities, level=level, iso=iso, tol=tol, step=step
@@ -2094,10 +2117,9 @@ class Vomp(nn.Module):
             )
             return np.empty((0, 3), dtype=np.float32)
 
-        # Convert voxel coordinates to world space centers
-        # Kaolin returns integer voxel coordinates, convert to world space [-0.5, 0.5]
+        # Convert voxel coordinates to world space centers.
         voxel_coords_cpu = voxel_coords.cpu().numpy()
-        voxel_centers = voxel_coords_cpu.astype(np.float32) / (2**level) - 0.5
+        voxel_centers = (voxel_coords_cpu.astype(np.float32) + 0.5) / (2**level) - 0.5
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
@@ -2318,7 +2340,7 @@ class Vomp(nn.Module):
 
         # Aggregate features across views: mean in float32, then cast to float16 for storage
         arr = sampled_features.cpu().numpy()  # float32
-        feature_trim = 0.1 # bad dino features
+        feature_trim = 0.2 # bad dino features
         _k = int(feature_trim * arr.shape[0])
         if _k > 0:
             arr = np.sort(arr, axis=0)[_k: arr.shape[0] - _k]
