@@ -2318,6 +2318,10 @@ class Vomp(nn.Module):
 
         # Aggregate features across views: mean in float32, then cast to float16 for storage
         arr = sampled_features.cpu().numpy()  # float32
+        feature_trim = 0.1 # bad dino features
+        _k = int(feature_trim * arr.shape[0])
+        if _k > 0:
+            arr = np.sort(arr, axis=0)[_k: arr.shape[0] - _k]
         arr_mean_f16 = np.mean(arr, axis=0).astype(np.float16)
 
         # Save features to disk if requested
