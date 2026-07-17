@@ -21,6 +21,7 @@ feature extraction, and material property prediction for 3D objects.
 """
 
 import os
+import copy
 import json
 import glob
 import math
@@ -1527,6 +1528,8 @@ class Vomp(nn.Module):
             ply_path = gaussian_model
             gaussian_model = Gaussian(sh_degree=sh_degree, aabb=aabb, device=device)
             gaussian_model.load_ply(ply_path)
+        else:
+            gaussian_model = copy.deepcopy(gaussian_model)
 
         if output_dir is None:
             output_dir = f"/tmp/Vomp_splat_{id(gaussian_model)}"
