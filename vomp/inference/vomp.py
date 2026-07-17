@@ -2339,7 +2339,16 @@ class Vomp(nn.Module):
 
         # Aggregate features across views: mean in float32, then cast to float16 for storage
         arr = sampled_features.cpu().numpy()  # float32
-        arr = arr[np.argsort([torch.inverse(d["extrinsics"])[2, 3].item() for d in data])[: len(data) // 3]]  # keep below-horizon views
+        _vk = getattr(self, "_view_keep", None)  # orientation -> explicit view ids to keep
+        if isinstance(_vk, str):
+            _p = os.path.join(os.path.dirname(__file__), "view_dirs.json")
+            with open(_p) as _f:
+                _vk = json.load(_f).get(_vk)
+        if _vk is not None:  # keep exactly the listed views
+            arr = arr[np.asarray(_vk, int)]
+        else:
+            _cz = [float(torch.inverse(d["extrinsics"])[2, 3]) for d in data]
+            arr = arr[np.argsort(_cz)[: len(data) // 3]]
         arr_mean_f16 = np.mean(arr, axis=0).astype(np.float16)
 
         # Save features to disk if requested
