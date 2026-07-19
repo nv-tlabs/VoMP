@@ -391,6 +391,29 @@ The viewer also saves the colorbars for visualizations as PNG images that look l
 
 ![Colorbar](images/youngs_modulus_colorbar_legend.png)
 
+### Exporting Physics Materials to USD
+
+You can also write the predicted properties as a USD file. The resulting USD is directly consumable by [kaolin.io.usd.get_physics_material](https://kaolin.readthedocs.io/) and the [Simplicits](https://kaolin.readthedocs.io/en/latest/notes/simplicits.html) APIs (i.e. it can be loaded as a `kaolin.physics.simplicits.PhysicsPoints`).
+
+```python
+from vomp.inference.utils import save_materials
+
+# Standalone: create a new USD that embeds the predicted points as a
+# UsdGeomPoints prim and attaches the (E, nu, rho) physics material to it.
+save_materials(results, "vomp_points.usda")
+
+# Attach: copy an existing USD and attach the predicted physics material to
+# a prim inside it.
+save_materials(
+    results,
+    "model_with_vomp.usda",
+    input_usd_path="model.usd",
+    scene_path="/World/asset/Mesh",
+)
+```
+
+When `results` comes from `model.get_usd_materials(...)`, the source USD path is stashed in `results["source_usd_path"]` and is used as the default `input_usd_path`. `appx_vol` defaults to the bounding-box volume of the predicted points and can be overridden via the `appx_vol=<float>` kwarg.
+
 ## 🔧 Low-Level API
 
 ### Gaussian Splats

@@ -15,12 +15,17 @@
 
 """
 Inference utilities for VoMP material property estimation.
-
-This module provides the core inference capabilities for estimating material properties
-from 3D representations using vision transformers and neural networks.
 """
 
-from .utils import LazyLoadDino, MaterialUpsampler, save_materials, load_materials
+from .utils import (
+    LazyLoadDino,
+    MaterialUpsampler,
+    save_materials,
+    save_materials_usd,
+    load_materials,
+    load_gaussian_usd,
+    get_gaussian_usd_segments,
+)
 from .vomp import Vomp
 from .replicator_renderer import RTX_PRESETS
 
@@ -28,7 +33,10 @@ __all__ = [
     "LazyLoadDino",
     "MaterialUpsampler",
     "save_materials",
+    "save_materials_usd",
     "load_materials",
+    "load_gaussian_usd",
+    "get_gaussian_usd_segments",
     "Vomp",
     "RTX_PRESETS",
 ]
