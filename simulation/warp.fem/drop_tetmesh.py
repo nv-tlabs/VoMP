@@ -33,13 +33,12 @@ from material_loader import (
     load_material_data,
 )
 from vomp.inference.utils import MaterialUpsampler
+import polyscope as ps
+import polyscope.imgui as psim
 
 
 running = False
 def _run_with_ground_ui(sim):
-    import polyscope as ps
-    import polyscope.imgui as psim
-
     active_cells = None if sim.cells is None else sim.cells.array.numpy()
 
     try:

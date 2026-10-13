@@ -26,9 +26,6 @@ from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
     SIMREADY_ASSET_CLASS_MAPPING as ASSET_CLASS_MAPPING,
 )
 from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
-    SIMREADY_MATERIALS_DIR as PHYSICS_MATERIALS_DIR,
-)
-from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
     SIMREADY_PROPS_DIR as PROPS_DIR,
 )
 from dataset_toolkits.material_objects.vlm_annotations.utils.render import (
@@ -40,97 +37,113 @@ from dataset_toolkits.material_objects.vlm_annotations.utils.vlm import (
 )
 import re
 from tqdm import tqdm
+from dataset_toolkits.material_objects.vlm_annotations.asset_finder import (
+    select_simready_entrypoint,
+)
+from dataset_toolkits.material_objects.vlm_annotations.vlm_input_builder import (
+    make_simready_user_prompt,
+)
+import traceback
+import json
+from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
+    UsdJsonEncoder,
+    extract_simready_materials_from_usd as extract_materials_from_usd,
+    load_physics_materials,
+    parse_material_name,
+)
 
 PROMPTS = {
     "few_shot_examples": (
         """
+Text-only calibration cases (no example images are supplied for these cases):
+- These cases deliberately span compliant foams, elastomers, plastics, wood, and metals. They illustrate scale; they are not lookup bins or class defaults.
+- Do not copy a value merely because a broad label such as metal, plastic, fabric, or organic is similar. Identify the material subtype, physical form, and exact segment usage first.
+- Estimate room-temperature, dry, small-strain effective properties for the bulk material represented by the exact segment. For porous materials, density means apparent bulk density, not solid-polymer or fiber density.
+- For layered objects, annotate the isolated segment: a cushion core is bulk foam, whereas an explicitly isolated upholstery cover is textile or leather. For anisotropic materials, the required scalar modulus is an effective approximation for the loading direction most consistent with the segment's usage.
+
 Example 1:
-Material: metal
-Opacity: opaque
-Density: 7800 kg/m^3
-Dynamic friction: 0.3
-Static friction: 0.4
-Restitution: 0.3
-Usage: structural component
+Material: flexible open-cell polyurethane foam
+Usage: soft seat-cushion core
 
-Analysis: 
-Step 1: Based on the images, this appears to be a standard structural steel with a matte gray finish.
-Step 2: The surface has medium roughness with some subtle texture visible in the reflection pattern.
-Step 3: The physical properties (density, friction values, restitution) are consistent with carbon steel.
-Step 4: Considering the usage and measured properties:
-   - High stiffness (Young's modulus ~200 GPa) based on typical steel values
-   - Medium Poisson's ratio typical of metals
-   - High density matching the measured 7800 kg/m^3
+Analysis:
+Step 1: The named segment is the compliant cushion core, not a thin upholstery cover and not solid polyurethane.
+Step 2: Open-cell foam is a porous cellular structure, so its effective bulk stiffness and apparent density are far below those of the polymer forming the cell walls.
+Step 3: Flexible seat foam is nonlinear and rate dependent; use a representative small-vibration linearized modulus for this requested scalar label.
+Step 4: A soft 65 kg/m^3 seat foam is represented by about 0.20 MPa Young's modulus and a Poisson's ratio of 0.25.
 
-Young's modulus: 2.0e11 Pa
-Poisson's ratio: 0.29
-Density: 7800 kg/m^3
+Young's modulus: 2.0e5 Pa
+Poisson's ratio: 0.25
+Density: 6.5e1 kg/m^3
 
 Example 2:
-Material: plastic
-Opacity: opaque
-Density: 950 kg/m^3
-Dynamic friction: 0.25
-Static friction: 0.35
-Restitution: 0.6
-Usage: household container
+Material: 6061-T6 aluminum alloy
+Usage: lightweight rigid frame member
 
 Analysis:
-Step 1: The material shows the characteristic smooth, uniform appearance of a consumer plastic.
-Step 2: It has moderate gloss with some translucency and a slight texture.
-Step 3: The physical properties (medium-low density, moderate friction, higher restitution) match polypropylene.
-Step 4: Based on these observations and measurements:
-   - Medium-low stiffness typical of polyolefin plastics
-   - Higher Poisson's ratio indicating good lateral deformation
-   - Density matching the measured 950 kg/m^3
+Step 1: The stated alloy and lightweight frame usage identify aluminum rather than treating every metal-colored segment as steel.
+Step 2: Surface color or finish alone cannot determine a metal alloy, so subtype and structural usage are decisive here.
+Step 3: Wrought 6061-T6 is a stiff, low-density metal at room temperature, but is roughly three times less stiff and dense than steel.
+Step 4: Representative elastic constants are about 68.3 GPa Young's modulus, 0.33 Poisson's ratio, and 2700 kg/m^3 density.
 
-Young's modulus: 1.3e9 Pa
-Poisson's ratio: 0.42
-Density: 950 kg/m^3
+Young's modulus: 6.83e10 Pa
+Poisson's ratio: 0.33
+Density: 2.70e3 kg/m^3
 
 Example 3:
-Material: fabric
-Opacity: opaque
-Density: 300 kg/m^3
-Dynamic friction: 0.55
-Static friction: 0.75
-Restitution: 0.2
-Usage: furniture covering
+Material: cured Sylgard 184 PDMS silicone rubber
+Usage: soft vibration-isolation pad
 
 Analysis:
-Step 1: The material shows a woven textile structure with visible fibers.
-Step 2: The surface has significant texture with a matte appearance and no specular highlights.
-Step 3: The physical properties (low density, high friction, low restitution) match a woven textile.
-Step 4: Based on these observations and measurements:
-   - Low stiffness as expected for flexible textiles
-   - Medium-high Poisson's ratio from the woven structure
-   - Density matching the measured 300 kg/m^3
+Step 1: The exact segment is a cured silicone elastomer pad, not a rigid thermoplastic or a cellular cushion foam.
+Step 2: A solid elastomer is much denser than foam but remains highly compliant and nearly incompressible.
+Step 3: Silicone is nonlinear at large strain, so use a representative small-strain effective modulus and keep Poisson's ratio just below 0.5.
+Step 4: Typical cured Sylgard 184 values are about 2 MPa Young's modulus, 0.495 Poisson's ratio, and 1030 kg/m^3 density.
 
-Young's modulus: 1.2e8 Pa
-Poisson's ratio: 0.38
-Density: 300 kg/m^3
+Young's modulus: 2.0e6 Pa
+Poisson's ratio: 0.495
+Density: 1.03e3 kg/m^3
 
 Example 4:
-Material: organic
-Opacity: opaque
-Density: 400 kg/m^3
-Dynamic friction: 0.45
-Static friction: 0.65
-Restitution: 0.15
-Usage: decorative element
+Material: structural carbon steel
+Usage: load-bearing beam
 
 Analysis:
-Step 1: This is an organic material with the characteristic structure of natural fibers.
-Step 2: The surface shows a natural pattern, matte finish, and relatively brittle structure.
-Step 3: The physical properties (low density, moderate-high friction, low restitution) align with plant-based materials.
-Step 4: Considering similar organic materials and the measured properties:
-   - Low-medium stiffness in the fiber direction
-   - Medium Poisson's ratio reflecting the fibrous structure
-   - Density matching the measured 400 kg/m^3
+Step 1: The stated structural-carbon-steel subtype and beam usage identify an iron-based structural alloy rather than a generic metallic finish.
+Step 2: Geometry and usage support a load-bearing metal, while the subtype distinguishes it from aluminum, brass, or a thin plated polymer.
+Step 3: Carbon steel has high elastic stiffness and density at room temperature.
+Step 4: Representative structural-steel values are about 200 GPa Young's modulus, 0.30 Poisson's ratio, and 7850 kg/m^3 density.
 
-Young's modulus: 2.5e9 Pa
+Young's modulus: 2.0e11 Pa
 Poisson's ratio: 0.30
-Density: 400 kg/m^3
+Density: 7.85e3 kg/m^3
+
+Example 5:
+Material: clear coastal Douglas-fir wood at approximately 12 percent moisture
+Usage: furniture rail loaded primarily along the grain
+
+Analysis:
+Step 1: This is a solid wood member with a specified species, moisture condition, and primary loading direction, not a generic organic-material bin.
+Step 2: Wood is orthotropic; its longitudinal stiffness is much larger than its radial or tangential stiffness.
+Step 3: Because this rail is used along the grain, the requested scalar should approximate the longitudinal small-strain modulus rather than an arbitrary isotropic wood value.
+Step 4: Clear coastal Douglas-fir near 12 percent moisture is represented by about 13.4 GPa longitudinal modulus, 0.292 longitudinal-radial Poisson's ratio, and 540 kg/m^3 density.
+
+Young's modulus: 1.34e10 Pa
+Poisson's ratio: 0.292
+Density: 5.4e2 kg/m^3
+
+Example 6:
+Material: unfilled injection-molded polypropylene
+Usage: household container wall
+
+Analysis:
+Step 1: The named segment is an unfilled molded polypropylene wall, not an elastomer, foam, or fiber-reinforced engineering plastic.
+Step 2: The smooth consumer-plastic form and container usage are consistent with a low-density semicrystalline thermoplastic.
+Step 3: The precise polypropylene subtype supports a gigapascal-scale modulus, well above rubber but far below wood or metal.
+Step 4: A representative unfilled grade has about 1.2 GPa Young's modulus, 0.40 Poisson's ratio, and 905 kg/m^3 density.
+
+Young's modulus: 1.2e9 Pa
+Poisson's ratio: 0.40
+Density: 9.05e2 kg/m^3
 """
     ),
     "query_prompt": (
@@ -143,8 +156,8 @@ Respond using EXACTLY the following format (do not deviate from this structure):
 Analysis: 
 Step 1: Identify the material class/type based on visual appearance
 Step 2: Describe the surface characteristics (texture, reflectivity, color)
-Step 3: Determine the specific material subtype considering its physical properties
-Step 4: Reason through each property estimate based on visual and measured data
+Step 3: Determine the specific material subtype considering its segment usage
+Step 4: Reason through each property estimate based on visual and contextual clues
 
 Young's modulus: <value in scientific notation> Pa
 Poisson's ratio: <single decimal value between 0.0 and 0.5>
@@ -170,38 +183,21 @@ def make_user_prompt(
     restitution,
     semantic_usage,
     has_texture_sphere=True,
+    object_name=None,
 ):
-    intro_text = (
-        """
-You are a materials science expert analyzing two images:
-1. A photo of the full object (showing how the material appears in context).
-2. A sphere with the material's texture (showing color/roughness/reflectivity in isolation).
-
-Using both images and the information below, identify the real-world material and estimate its mechanical properties.
-"""
-        if has_texture_sphere
-        else """
-You are a materials science expert analyzing an image of the full object (showing how the material appears in context).
-
-Using this image and the information below, identify the real-world material and estimate its mechanical properties.
-"""
+    del (
+        density,
+        dynamic_friction,
+        static_friction,
+        restitution,
+        has_texture_sphere,
     )
-
-    return f"""{intro_text}
-Material context:
-  * Material type: {material_type}
-  * Opacity: {opacity}
-  * Density: {density if density is not None else 'unknown'} kg/m^3
-  * Dynamic friction: {dynamic_friction if dynamic_friction is not None else 'unknown'}
-  * Static friction: {static_friction if static_friction is not None else 'unknown'}
-  * Restitution: {restitution if restitution is not None else 'unknown'}
-  * Usage: {semantic_usage}
-
-Your task is to provide three specific properties:
-1. Young's modulus (in Pa using scientific notation)
-2. Poisson's ratio (a value between 0.0 and 0.5)
-3. Density (in kg/m^3 using scientific notation)
-"""
+    return make_simready_user_prompt(
+        material_type,
+        opacity,
+        semantic_usage,
+        object_name=object_name,
+    )
 
 
 # Use the centralized parser function from vlm.py instead
@@ -224,144 +220,10 @@ def list_simready_objects():
 
 
 def get_usd_file_from_prop_dir(prop_dir):
-    inst_base_files = glob.glob(os.path.join(prop_dir, "*_inst_base.usd"))
-    if inst_base_files:
-        return inst_base_files[0]
-
-    base_files = glob.glob(os.path.join(prop_dir, "*_base.usd"))
-    if base_files:
-        return base_files[0]
-
-    usd_files = glob.glob(os.path.join(prop_dir, "*.usd"))
-    if usd_files:
-        return usd_files[0]
-
-    print(f"Error: No USD file found in {prop_dir}")
-    sys.exit(1)
-
-
-def load_physics_materials():
-    """
-    Load physics material properties from USD files.
-
-    Returns:
-        dict: Dictionary mapping material types to physics properties
-    """
-    physics_materials = {}
-
-    # Check if physics materials directory exists
-    if not os.path.isdir(PHYSICS_MATERIALS_DIR):
-        print(
-            f"Warning: Physics materials directory not found at {PHYSICS_MATERIALS_DIR}"
-        )
-        print("Physics properties will not be available.")
-        return physics_materials
-
-    # Load each physics material file
-    for usda_file in glob.glob(os.path.join(PHYSICS_MATERIALS_DIR, "physics_*.usda")):
-        material_name = (
-            os.path.basename(usda_file).replace("physics_", "").replace(".usda", "")
-        )
-
-        try:
-            stage = Usd.Stage.Open(usda_file)
-            if not stage:
-                print(f"Warning: Could not open physics material file {usda_file}")
-                continue
-
-            # Find material prims with PhysicsMaterialAPI
-            material_prims = []
-            for prim in stage.Traverse():
-                # Check if the prim is a Material and has PhysicsMaterialAPI applied
-                if prim.IsA(UsdShade.Material) or "PhysicsMaterialAPI" in [
-                    s.GetName() for s in prim.GetAppliedSchemas()
-                ]:
-                    material_prims.append(prim)
-
-            if not material_prims:
-                # Try to find any prim with physics attributes as a fallback
-                for prim in stage.Traverse():
-                    if prim.HasAttribute("physics:density") or prim.HasAttribute(
-                        "physics:dynamicFriction"
-                    ):
-                        material_prims.append(prim)
-                        break
-
-            if not material_prims:
-                print(f"Warning: No physics material found in {usda_file}")
-                continue
-
-            material_prim = material_prims[0]
-
-            # Extract physics properties
-            density = (
-                material_prim.GetAttribute("physics:density").Get()
-                if material_prim.HasAttribute("physics:density")
-                else None
-            )
-            dynamic_friction = (
-                material_prim.GetAttribute("physics:dynamicFriction").Get()
-                if material_prim.HasAttribute("physics:dynamicFriction")
-                else None
-            )
-            static_friction = (
-                material_prim.GetAttribute("physics:staticFriction").Get()
-                if material_prim.HasAttribute("physics:staticFriction")
-                else None
-            )
-            restitution = (
-                material_prim.GetAttribute("physics:restitution").Get()
-                if material_prim.HasAttribute("physics:restitution")
-                else None
-            )
-
-            # Round values to 2 decimal places
-            physics_materials[material_name] = {
-                "density": round_float_to_2dp(density),
-                "dynamic_friction": round_float_to_2dp(dynamic_friction),
-                "static_friction": round_float_to_2dp(static_friction),
-                "restitution": round_float_to_2dp(restitution),
-            }
-
-            # print(f"Loaded physics material '{material_name}' with properties: density={round_float_to_2dp(density)}, dynamic_friction={round_float_to_2dp(dynamic_friction)}, static_friction={round_float_to_2dp(static_friction)}, restitution={round_float_to_2dp(restitution)}")
-
-        except Exception as e:
-            print(f"Error loading physics material {usda_file}: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-
-    return physics_materials
-
-
-def parse_material_name(material_name):
-    """
-    Parse a material name according to the SimReady convention.
-    Format: opacity__material-type__specific-usage
-
-    Args:
-        material_name (str): Material name
-
-    Returns:
-        tuple: (opacity, material_type, semantic_usage)
-    """
-    parts = material_name.split("__")
-
-    if len(parts) >= 3:
-        opacity = parts[0]
-        material_type = parts[1]
-        semantic_usage = parts[2]
-    elif len(parts) == 2:
-        opacity = parts[0]
-        material_type = parts[1]
-        semantic_usage = ""
-    else:
-        # Default values if the name doesn't follow the convention
-        opacity = "unknown"
-        material_type = material_name
-        semantic_usage = ""
-
-    return opacity, material_type, semantic_usage
+    entrypoint = select_simready_entrypoint(prop_dir)
+    if entrypoint is None:
+        raise FileNotFoundError(f"No USD file found in {prop_dir}")
+    return str(entrypoint)
 
 
 def find_textures_for_material(prop_dir, mesh_name, material_type):
@@ -442,7 +304,6 @@ def find_textures_for_material(prop_dir, mesh_name, material_type):
     mesh_parts = []
     if mesh_name:
         # Split by camel case or underscores
-        import re
 
         mesh_parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+", mesh_name)
         mesh_parts = [part.lower() for part in mesh_parts]
@@ -620,350 +481,6 @@ def find_textures_for_material(prop_dir, mesh_name, material_type):
         logging.info(
             f"Found textures for {prop_name}/{mesh_name if mesh_name else 'general'}: {', '.join(textures.keys())}"
         )
-
-    return textures
-
-
-def extract_materials_from_usd(usd_file_path, prop_name=None, prop_dir=None):
-    """
-    Extract material information from a USD file with improved texture handling.
-    First tries USD-based texture extraction, then falls back to directory searching.
-
-    Args:
-        usd_file_path (str): Path to the USD file
-        prop_name (str, optional): Name of the prop (directory name)
-        prop_dir (str, optional): Path to the prop directory
-
-    Returns:
-        dict: Dictionary mapping segment names to material info
-    """
-    if not os.path.exists(usd_file_path):
-        logging.error(f"USD file not found at {usd_file_path}")
-        return {"object_name": prop_name, "segments": {}}
-
-    try:
-        # Load physics materials
-        physics_materials = load_physics_materials()
-
-        # Open the USD stage
-        stage = Usd.Stage.Open(usd_file_path)
-        if not stage:
-            logging.error(f"Failed to open USD stage from {usd_file_path}")
-            return {"object_name": prop_name, "segments": {}}
-
-        # Get the default prim
-        default_prim = stage.GetDefaultPrim()
-        if not default_prim:
-            default_prim = stage.GetPrimAtPath("/")
-
-        # Create the result dictionary with prop name, dataset type, and category
-        category = ASSET_CLASS_MAPPING.get(prop_name, "unknown")
-        result = {
-            "object_name": prop_name,
-            "category": category,
-            "dataset_type": "simready",
-            "file_path": usd_file_path,
-            "segments": {},
-        }
-
-        # Flag to track if we found any materials
-        found_materials = False
-
-        # Find all mesh prims
-        mesh_prims = []
-        for prim in Usd.PrimRange(default_prim):
-            if prim.GetTypeName() == "Mesh":
-                mesh_prims.append(prim)
-
-        if not mesh_prims:
-            logging.warning(f"No mesh prims found in {usd_file_path}")
-
-        # Process each mesh prim
-        for prim in mesh_prims:
-            mesh_name = prim.GetName()
-
-            # Get the full path for consistent segment key construction
-            full_path = str(prim.GetPath())
-            path_parts = full_path.split("/")
-            # Skip the root and default prim if needed
-            parent_parts = [p for p in path_parts[2:-1] if p]
-
-            # Construct segment key that matches the common.py convention
-            segment_key = mesh_name
-            if parent_parts:
-                segment_key = "_".join(parent_parts + [mesh_name])
-
-            # Get material binding
-            material_binding = UsdShade.MaterialBindingAPI(prim)
-            bound_material = None
-
-            if material_binding:
-                bound_material = material_binding.GetDirectBinding().GetMaterial()
-                if not bound_material:
-                    # Try to get bound material through collections
-                    for binding in material_binding.GetCollectionBindings():
-                        bound_material = binding.GetMaterial()
-                        if bound_material:
-                            break
-
-            # If material is found, extract its properties
-            if bound_material:
-                found_materials = True
-
-                # Get material name
-                material_name = bound_material.GetPath().name
-
-                # Parse material name
-                opacity, material_type, semantic_usage = parse_material_name(
-                    material_name
-                )
-
-                # Get physics properties for this material type if available
-                physics_props = physics_materials.get(material_type, {})
-
-                # First try USD-based texture extraction
-                textures = {}
-                if prop_dir:
-                    # Find the surface shader for this material
-                    surface_output = bound_material.GetSurfaceOutput()
-                    if surface_output.HasConnectedSource():
-                        connected_source = surface_output.GetConnectedSource()
-                        if connected_source[0]:
-                            shader_prim = connected_source[0].GetPrim()
-                            textures = extract_textures_from_shader(
-                                shader_prim, prop_dir
-                            )
-
-                    # If no textures found via USD, fall back to directory searching
-                    if not textures:
-                        logging.info(
-                            f"No USD textures found for {segment_key}, falling back to directory search"
-                        )
-                        textures = find_textures_for_material(
-                            prop_dir, mesh_name, material_type
-                        )
-
-                # Create material info dictionary with rounded values
-                result["segments"][segment_key] = {
-                    "name": material_name,
-                    "opacity": opacity,
-                    "material_type": material_type,
-                    "semantic_usage": semantic_usage,
-                    "density": round_float_to_2dp(physics_props.get("density")),
-                    "dynamic_friction": round_float_to_2dp(
-                        physics_props.get("dynamic_friction")
-                    ),
-                    "static_friction": round_float_to_2dp(
-                        physics_props.get("static_friction")
-                    ),
-                    "restitution": round_float_to_2dp(physics_props.get("restitution")),
-                    "textures": textures,
-                }
-
-        # If no materials were found but we have meshes, create default entries with textures
-        if not found_materials and mesh_prims and prop_dir:
-            logging.info(
-                f"No material bindings found for {prop_name}, creating default materials"
-            )
-
-            # Try to infer material type from prop name
-            material_type = "metal"  # Default
-            if "wood" in prop_name.lower():
-                material_type = "wood"
-            elif "metal" in prop_name.lower() or "aluminum" in prop_name.lower():
-                material_type = "metal"
-            elif "plastic" in prop_name.lower():
-                material_type = "plastic"
-            elif "fabric" in prop_name.lower() or "cloth" in prop_name.lower():
-                material_type = "fabric"
-
-            # Get physics properties for this material type
-            physics_props = physics_materials.get(material_type, {})
-
-            # Process each mesh
-            for prim in mesh_prims:
-                mesh_name = prim.GetName()
-
-                # Get the full path for consistent segment key construction
-                full_path = str(prim.GetPath())
-                path_parts = full_path.split("/")
-                # Skip the root and default prim if needed
-                parent_parts = [p for p in path_parts[2:-1] if p]
-
-                # Construct segment key that matches the common.py convention
-                segment_key = mesh_name
-                if parent_parts:
-                    segment_key = "_".join(parent_parts + [mesh_name])
-
-                # Find textures for this mesh using directory search (since no USD materials)
-                textures = find_textures_for_material(
-                    prop_dir, mesh_name, material_type
-                )
-
-                # If no textures found for this specific mesh, try more general search
-                if not textures:
-                    textures = find_textures_for_material(prop_dir, "", material_type)
-
-                # Create a default material info entry
-                if textures:
-                    default_material_name = f"default__{material_type}__{prop_name}"
-
-                    result["segments"][segment_key] = {
-                        "name": default_material_name,
-                        "opacity": "opaque",
-                        "material_type": material_type,
-                        "semantic_usage": prop_name,
-                        "density": round_float_to_2dp(physics_props.get("density")),
-                        "dynamic_friction": round_float_to_2dp(
-                            physics_props.get("dynamic_friction")
-                        ),
-                        "static_friction": round_float_to_2dp(
-                            physics_props.get("static_friction")
-                        ),
-                        "restitution": round_float_to_2dp(
-                            physics_props.get("restitution")
-                        ),
-                        "textures": textures,
-                    }
-
-                    found_materials = True
-
-        # Handle case where we couldn't find any materials or textures
-        if not found_materials:
-            logging.warning(f"No materials or textures found for {prop_name}")
-
-            # Create a minimal stub entry
-            if mesh_prims:
-                # Just use the first mesh
-                prim = mesh_prims[0]
-                mesh_name = prim.GetName()
-
-                # Get the full path for consistent segment key construction
-                full_path = str(prim.GetPath())
-                path_parts = full_path.split("/")
-                # Skip the root and default prim if needed
-                parent_parts = [p for p in path_parts[2:-1] if p]
-
-                # Construct segment key that matches the common.py convention
-                segment_key = mesh_name
-                if parent_parts:
-                    segment_key = "_".join(parent_parts + [mesh_name])
-
-                result["segments"][segment_key] = {
-                    "name": f"unknown_material",
-                    "opacity": "opaque",
-                    "material_type": "unknown",
-                    "semantic_usage": "",
-                    "density": None,
-                    "dynamic_friction": None,
-                    "static_friction": None,
-                    "restitution": None,
-                    "textures": {},
-                }
-
-        # Ensure category and dataset_type present (in case older function call didn't inject)
-        if "category" not in result:
-            result["category"] = ASSET_CLASS_MAPPING.get(prop_name, "unknown")
-        if "dataset_type" not in result:
-            result["dataset_type"] = "simready"
-
-        return result
-
-    except Exception as e:
-        logging.error(f"Error extracting materials for {prop_name}: {str(e)}")
-        import traceback
-
-        logging.error(traceback.format_exc())
-        return {"object_name": prop_name, "segments": {}}
-
-
-def extract_textures_from_shader(shader_prim, prop_dir):
-    """
-    Extract texture information directly from a shader prim.
-
-    Args:
-        shader_prim: USD shader prim
-        prop_dir: Path to prop directory for resolving relative paths
-
-    Returns:
-        dict: Dictionary of texture paths by type
-    """
-    textures = {}
-
-    if not shader_prim.IsA(UsdShade.Shader):
-        return textures
-
-    shader = UsdShade.Shader(shader_prim)
-
-    # Map of USD shader input names to our texture type names
-    texture_input_mapping = {
-        "diffuse_texture": "albedo",
-        "albedo_texture": "albedo",
-        "basecolor_texture": "albedo",
-        "normalmap_texture": "normal",
-        "normal_texture": "normal",
-        "reflectionroughness_texture": "roughness",
-        "roughness_texture": "roughness",
-        "metallic_texture": "metallic",
-        "orm_texture": "orm",
-        "emissive_texture": "emissive",
-        "opacity_texture": "opacity",
-    }
-
-    # Get all shader inputs
-    shader_inputs = shader.GetInputs()
-
-    for shader_input in shader_inputs:
-        input_name = shader_input.GetBaseName()
-
-        # Check if this input corresponds to a texture
-        texture_type = texture_input_mapping.get(input_name)
-        if texture_type:
-            # Get the connected source
-            source_info = shader_input.GetConnectedSource()
-            if source_info[0]:  # If connected
-                source_prim = source_info[0].GetPrim()
-                if source_prim.IsA(UsdShade.Shader):
-                    # This is a texture node - get the file path
-                    texture_shader = UsdShade.Shader(source_prim)
-                    file_input = texture_shader.GetInput("file")
-                    if file_input:
-                        texture_path = file_input.Get()
-                        if texture_path:
-                            # Convert to absolute path if relative
-                            if not os.path.isabs(texture_path):
-                                texture_path = os.path.join(prop_dir, texture_path)
-                            textures[texture_type] = texture_path
-
-        # Also check direct file inputs (some shaders may have direct file paths)
-        elif input_name == "file" or input_name.endswith("_file"):
-            texture_path = shader_input.Get()
-            if texture_path:
-                # Try to infer texture type from filename
-                lower_name = os.path.basename(texture_path).lower()
-                if (
-                    "albedo" in lower_name
-                    or "basecolor" in lower_name
-                    or "diffuse" in lower_name
-                ):
-                    texture_type = "albedo"
-                elif "normal" in lower_name:
-                    texture_type = "normal"
-                elif "roughness" in lower_name:
-                    texture_type = "roughness"
-                elif "metallic" in lower_name:
-                    texture_type = "metallic"
-                elif "orm" in lower_name:
-                    texture_type = "orm"
-                elif "emissive" in lower_name:
-                    texture_type = "emissive"
-                else:
-                    texture_type = "albedo"  # Default to albedo
-
-                # Convert to absolute path if relative
-                if not os.path.isabs(texture_path):
-                    texture_path = os.path.join(prop_dir, texture_path)
-                textures[texture_type] = texture_path
 
     return textures
 
@@ -1201,7 +718,6 @@ def extract_materials_from_usd_improved(usd_file_path, prop_name=None, prop_dir=
 
     except Exception as e:
         logging.error(f"Error extracting materials for {prop_name}: {str(e)}")
-        import traceback
 
         logging.error(traceback.format_exc())
         return {"object_name": prop_name, "segments": {}}
@@ -1378,13 +894,16 @@ def process_simready_objects(
                                 )
                                 continue
 
+                            source_physics = segment_info.get(
+                                "source_physics", {}
+                            )
                             part1 = make_user_prompt(
                                 segment_info["material_type"],
                                 segment_info["opacity"],
-                                segment_info["density"],
-                                segment_info["dynamic_friction"],
-                                segment_info["static_friction"],
-                                segment_info["restitution"],
+                                None,
+                                source_physics.get("dynamic_friction"),
+                                source_physics.get("static_friction"),
+                                source_physics.get("restitution"),
                                 segment_info["semantic_usage"],
                                 has_texture_sphere=segment_render_path is not None,
                             )
@@ -1435,7 +954,7 @@ def process_simready_objects(
                                     )
 
                                 if vlm_analysis.get("density") is not None:
-                                    segment_info["density"] = vlm_analysis.get(
+                                    segment_info["vlm_density"] = vlm_analysis.get(
                                         "density"
                                     )
 
@@ -1458,8 +977,6 @@ def process_simready_objects(
                                     f"VLM analysis failed for {segment_key}: {vlm_analysis.get('error', 'Unknown error')}"
                                 )
                         except Exception as e:
-                            import traceback
-
                             logging.error(
                                 f"Error during VLM analysis for {segment_key}: {str(e)}"
                             )
@@ -1474,11 +991,6 @@ def process_simready_objects(
                 if output_file:
                     try:
                         with open(output_file, "w") as f:
-                            import json
-                            from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
-                                UsdJsonEncoder,
-                            )
-
                             # Debug save contents
                             logging.info(
                                 f"Saving checkpoint with {len(all_results)} objects"
@@ -1505,7 +1017,6 @@ def process_simready_objects(
 
                     except Exception as e:
                         logging.error(f"Error saving checkpoint: {str(e)}")
-                        import traceback
 
                         logging.error(traceback.format_exc())
             else:
@@ -1513,8 +1024,6 @@ def process_simready_objects(
                 failed_props.append(prop_name)
 
         except Exception as e:
-            import traceback
-
             logging.error(f"Error processing {prop_name}: {str(e)}")
             logging.error(traceback.format_exc())
             failed_props.append(prop_name)

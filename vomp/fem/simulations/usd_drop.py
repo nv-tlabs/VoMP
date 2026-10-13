@@ -38,6 +38,12 @@ from vomp.fem.simulations.object_simulation import (
     voxelize_mesh,
     build_tet_mesh,
 )
+from pxr import Usd, UsdGeom
+from scipy.spatial import KDTree
+import polyscope as ps
+import polyscope.imgui as psim
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 
 def compute_usd_bounds(file_path):
@@ -53,12 +59,6 @@ def compute_usd_bounds(file_path):
     tuple[np.ndarray, np.ndarray]
         (min_bounds, max_bounds) each shape (3,), dtype float32
     """
-    try:
-        from pxr import Usd, UsdGeom
-    except ImportError:
-        raise RuntimeError(
-            "pxr module not found. Please install the USD Python bindings (pip install usd-core)."
-        )
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"USD file '{file_path}' not found")
@@ -295,8 +295,6 @@ def main():
         f"Mesh indices per voxel: min={voxel_mesh_idx.min()}, max={voxel_mesh_idx.max()}"
     )
 
-    from scipy.spatial import KDTree
-
     voxel_tree = KDTree(voxel_centers)
 
     n_cells = geo.cell_count()
@@ -456,9 +454,6 @@ def main():
     if not args.ui:
         return
 
-    import polyscope as ps
-    import polyscope.imgui as psim
-
     ps.init()
     ps.set_ground_plane_mode("tile")
     ps.set_ground_plane_height(0.0)
@@ -503,9 +498,6 @@ def main():
     E_log_min, E_log_max = np.log10(E_min), np.log10(E_max)
     E_normalized = (E_log - E_log_min) / (E_log_max - E_log_min + 1e-9)
 
-    import matplotlib.pyplot as plt
-    import matplotlib.cm as cm
-
     colormap = cm.get_cmap("viridis")
     colors = colormap(E_normalized)[:, :3]
 
@@ -542,8 +534,6 @@ def main():
     except:
 
         pass
-
-    from scipy.spatial import KDTree
 
     kdtree = KDTree(recorded[0])
 

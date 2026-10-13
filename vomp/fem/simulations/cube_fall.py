@@ -40,6 +40,8 @@ from vomp.fem.fem_examples.mfem.softbody_sim import (
 from vomp.fem.fem_examples.mfem.mfem_3d import MFEM_RS_F, MFEM_sF_S
 
 from vomp.fem.fem_examples.mfem.collisions import CollisionHandler
+import polyscope as ps
+import polyscope.imgui as psim
 
 
 def build_geometry(res: int):
@@ -111,8 +113,6 @@ def main():
     # ------------------------------------------------------------------
     # Re-enable Polyscope ground plane that run_softbody_sim disables
     def _viewer_init():
-        import polyscope as ps
-
         ps.set_ground_plane_mode("tile")
 
     if args.ui:
@@ -129,8 +129,6 @@ def main():
         # ---------------------------------------------
         # Build Polyscope viewer with slider
         # ---------------------------------------------
-        import polyscope.imgui as psim
-        import polyscope as ps
 
         ps.init()
         ps.set_ground_plane_mode("tile")  # plane at y = 0 matches ground_height

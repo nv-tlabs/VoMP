@@ -32,6 +32,7 @@ from warp.fem import Field, Sample, Domain, integrand, normal
 
 from vomp.fem.simulations.compress_two_cubes import build_cube_geo, clamp_bottom_face
 from vomp.fem.fem_examples.mfem.softbody_sim import ClassicFEM
+from itertools import product
 
 
 @fem.integrand
@@ -237,9 +238,6 @@ def main():
             tuple(args.triplets[i : i + 3]) for i in range(0, len(args.triplets), 3)
         ]
     else:
-
-        from itertools import product
-
         if args.quick:
 
             E_grid = [1e5, 1e6]

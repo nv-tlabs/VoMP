@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-import math
 
 
 class ResidualBlock(nn.Module):
@@ -93,11 +92,16 @@ class RadialFlow(nn.Module):
 
         z_new = z + beta * h * diff
 
-        # Compute log determinant with clamping for stability
+        # Radial-flow Jacobian determinant.
         bh = beta * h.squeeze(-1)  # (B,)
-        bh_clamped = torch.clamp(bh, min=-0.999, max=0.999)
-        term1 = (z.size(1) - 1) * torch.log1p(bh_clamped)
-        term2 = torch.log1p(bh_clamped - beta * (h.squeeze(-1) ** 2) * r.squeeze(-1))
+        factor_tangent = 1.0 + bh
+        factor_radial = (
+            factor_tangent
+            - beta * (h.squeeze(-1) ** 2) * r.squeeze(-1)
+        )
+        tiny = torch.finfo(z.dtype).tiny
+        term1 = (z.size(1) - 1) * torch.log(factor_tangent.clamp_min(tiny))
+        term2 = torch.log(factor_radial.clamp_min(tiny))
         log_det = term1 + term2
 
         return z_new, log_det_j + log_det
@@ -125,7 +129,7 @@ class TripletVAE(nn.Module):
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
         self.use_additional_losses = use_additional_losses
-
+        self.reconstruction_weights = kwargs.pop("reconstruction_weights", None)
         # — Encoder (optimized for VAE training)
         self.enc_in = nn.Linear(3, width)  # Removed dropout
         self.encoder = nn.Sequential(
@@ -284,7 +288,7 @@ class TripletVAE(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """Return improved recon loss, total KL and a dict including sampled `z` for TC loss."""
+        """Return reconstruction loss and Monte Carlo KL for the flowed posterior."""
 
         # Encode & sample
         z, mu, logvar = self.encode(x, sample=True)
@@ -307,7 +311,14 @@ class TripletVAE(nn.Module):
         # Compute reconstruction loss
         if self.use_additional_losses:
             # 1. MSE loss for direct reconstruction (helps with mean prediction)
-            mse_loss = F.mse_loss(x_mu, x, reduction="mean")
+            if self.reconstruction_weights is None:
+                mse_loss = F.mse_loss(x_mu, x, reduction="mean")
+            else:
+                weights = x_mu.new_tensor(self.reconstruction_weights)
+                mse_loss = (
+                    (x_mu - x).square().mul(weights).sum(dim=-1).mean()
+                    / weights.sum()
+                )
 
             if self.use_learned_variances:
                 # 2. NLL loss (helps with uncertainty estimation) - only when we have learned variances

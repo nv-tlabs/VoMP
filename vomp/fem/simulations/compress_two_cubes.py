@@ -30,6 +30,8 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vomp.fem.fem_examples.mfem.softbody_sim import ClassicFEM, run_softbody_sim
+import polyscope as ps
+import polyscope.imgui as psim
 
 # -----------------------------------------------------------------------------
 # Geometry helper
@@ -189,9 +191,6 @@ def main():
     print("Potential energies (left_cube, right_cube):", energies)
 
     if args.ui:
-        import polyscope as ps
-        import polyscope.imgui as psim
-
         ps.init()
         ps.set_ground_plane_mode("shadow_only")
 
@@ -285,7 +284,6 @@ def main():
         ps.show()
     else:
         # Headless mode - save screenshots
-        import polyscope as ps
 
         ps.init()
         ps.set_ground_plane_mode("shadow_only")

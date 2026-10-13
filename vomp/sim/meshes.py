@@ -28,6 +28,11 @@ from uipc.geometry import (
 from uipc.constitution import StableNeoHookean, ElasticModuli
 from uipc.unit import kPa, GPa
 from scipy.spatial import cKDTree
+import tempfile
+import shutil
+import glob
+from scipy.spatial import Delaunay
+import math
 
 
 def compute_barycentric_coordinates(point, tet_vertices):
@@ -602,9 +607,6 @@ def load_visual_mesh(
         final_size = final_bbox_max - final_bbox_min
         print(f"Final bounding box: center={final_center}, size={final_size}")
 
-        import tempfile
-        import shutil
-
         temp_dir = tempfile.mkdtemp(prefix="trellis_visual_mesh_")
         temp_obj_path = os.path.join(temp_dir, "normalized_mesh.obj")
 
@@ -844,8 +846,6 @@ def write_visual_meshes_obj(
         return
 
     output_dir = os.path.dirname(output_path)
-    import glob
-    import shutil
 
     # Collect per-object material information
     object_materials = {}
@@ -1235,8 +1235,6 @@ class MeshProcessor:
         return vertices, tets
 
     def build_tet_mesh_from_voxels(self, voxel_centers):
-        from scipy.spatial import Delaunay
-
         # Estimate actual scale from mesh dimensions (voxel centers are already transformed)
         mesh_size = np.max(voxel_centers, axis=0) - np.min(voxel_centers, axis=0)
         avg_mesh_dimension = np.mean(mesh_size)
@@ -1421,8 +1419,6 @@ class MeshProcessor:
     def assign_per_tetrahedron_materials(
         self, mesh, material_props, scale=1.0, rotation=None, translation=None
     ):
-        from scipy.spatial import cKDTree
-
         tetrahedra = mesh.tetrahedra()
         vertices = mesh.vertices()
 
@@ -1461,8 +1457,6 @@ class MeshProcessor:
 
         # 2. Apply rotation if specified
         if rotation is not None:
-            import math
-
             print(f"Rotating material voxel positions by: {rotation} degrees")
 
             # Create rotation matrix - same order as mesh rotation (Z, Y, X)
@@ -1717,7 +1711,6 @@ class MeshProcessor:
             if "rotation" in obj_config:
                 r = obj_config["rotation"]
                 # Convert degrees to radians and apply rotations in order: Z, Y, X
-                import math
 
                 if r[2] != 0:
                     angle_rad = math.radians(r[2])
@@ -1878,7 +1871,6 @@ class MeshProcessor:
         vertex_coords = np.array(vertex_coords)
 
         # Find vertices close to frame positions using KDTree for efficiency
-        from scipy.spatial import cKDTree
 
         frame_tree = cKDTree(frame_positions)
 

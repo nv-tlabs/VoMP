@@ -124,6 +124,7 @@ class StandardVAE(nn.Module):
         self.min_logvar = min_logvar
         self.max_logvar = max_logvar
         self.use_additional_losses = use_additional_losses
+        self.reconstruction_weights = kwargs.pop("reconstruction_weights", None)
 
         # — Encoder (optimized for VAE training)
         self.enc_in = nn.Linear(3, width)  # Removed dropout
@@ -316,7 +317,14 @@ class StandardVAE(nn.Module):
 
         if self.use_additional_losses:
             # 1. MSE loss for direct reconstruction (helps with mean prediction)
-            mse_loss = F.mse_loss(x_mu, x, reduction="mean")
+            if self.reconstruction_weights is None:
+                mse_loss = F.mse_loss(x_mu, x, reduction="mean")
+            else:
+                weights = x_mu.new_tensor(self.reconstruction_weights)
+                mse_loss = (
+                    (x_mu - x).square().mul(weights).sum(dim=-1).mean()
+                    / weights.sum()
+                )
 
             if self.use_learned_variances:
                 # 2. NLL loss (helps with uncertainty estimation) - only when we have learned variances

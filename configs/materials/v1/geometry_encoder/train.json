@@ -1,8 +1,5 @@
 {
-    "geometry_checkpoint_dir": "weights/geometry_transformer.pt",
-    "matvae_checkpoint_dir": "weights/matvae.safetensors",
-    "normalization_params_path": "weights/normalization_params.json",
-    "matvae_checkpoint": "weights/matvae.safetensors",
+    "matvae_checkpoint": "outputs/vomp1/matvae/final_model/model.safetensors",
     "trellis_weights_path": "weights/TRELLIS-image-large",
     "models": {
         "geometry_encoder": {
@@ -21,7 +18,7 @@
             }
         },
         "matvae": {
-            "name": "matvae",
+            "name": "TripletVAE",
             "args": {
                 "width": 256,
                 "depth": 3,
@@ -42,7 +39,10 @@
             "resolution": 64,
             "min_aesthetic_score": 0.0,
             "max_num_voxels": 32768,
-            "compute_material_stats": false
+            "compute_material_stats": false,
+            "archive_format": "benchmark",
+            "random_grid_rotation": false,
+            "segment_balanced_sampling": false
         }
     },
     "trainer": {
@@ -54,7 +54,7 @@
             "optimizer": {
                 "name": "AdamW",
                 "args": {
-                    "lr": 1e-4,
+                    "lr": 0.0001,
                     "weight_decay": 0.0
                 }
             },
@@ -82,5 +82,6 @@
             "i_eval": 1000,
             "loss_type": "l1"
         }
-    }
+    },
+    "normalization_params_path": "outputs/vomp1/matvae/normalization_params.json"
 }

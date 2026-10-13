@@ -41,6 +41,10 @@ from vomp.fem.simulations.object_simulation import (
     voxelize_mesh,
     build_tet_mesh,
 )
+from pxr import Usd, UsdGeom
+import polyscope as ps
+import polyscope.imgui as psim
+from scipy.spatial import KDTree
 
 
 def compute_usd_bounds(file_path):
@@ -56,12 +60,6 @@ def compute_usd_bounds(file_path):
     tuple[np.ndarray, np.ndarray]
         (min_bounds, max_bounds) each shape (3,), dtype float32
     """
-    try:
-        from pxr import Usd, UsdGeom
-    except ImportError:
-        raise RuntimeError(
-            "pxr module not found. Please install the USD Python bindings (pip install usd-core)."
-        )
 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"USD file '{file_path}' not found")
@@ -853,9 +851,6 @@ def main():
     if not args.ui:
         return
 
-    import polyscope as ps
-    import polyscope.imgui as psim
-
     ps.init()
     ps.set_ground_plane_mode("tile")
     ps.set_ground_plane_height(0.0)
@@ -977,8 +972,6 @@ def main():
     cube_tet_mesh.set_color((0.8, 0.2, 0.2))  # Red color for cube physics mesh
     cube_tet_mesh.set_edge_width(2.0)
     cube_tet_mesh.set_edge_color((0.5, 0.0, 0.0))
-
-    from scipy.spatial import KDTree
 
     kdtree = KDTree(recorded[0])
 

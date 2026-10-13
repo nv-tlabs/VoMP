@@ -20,6 +20,16 @@ This module provides the core inference capabilities for estimating material pro
 from 3D representations using vision transformers and neural networks.
 """
 
+import os
+
+os.environ.setdefault("ATTN_BACKEND", "xformers")
+os.environ.setdefault(
+    "SPARSE_ATTN_BACKEND",
+    os.environ["ATTN_BACKEND"]
+    if os.environ["ATTN_BACKEND"] in {"xformers", "flash_attn"}
+    else "xformers",
+)
+
 from .utils import LazyLoadDino, MaterialUpsampler, save_materials, load_materials
 from .vomp import Vomp
 from .replicator_renderer import RTX_PRESETS

@@ -14,17 +14,32 @@
 # limitations under the License.
 
 import os
+import json
+import hashlib
 import shutil
 import sys
 import time
-import importlib
 import argparse
+import zipfile
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from easydict import EasyDict as edict
 from concurrent.futures import ThreadPoolExecutor
 import utils3d
+
+from dataset_toolkits.datasets import ABO, allmats, simready
+from dataset_toolkits.dino import (
+    DINO_FEATURE_DIM,
+    DINO_MODEL,
+    DINO_REPOSITORY,
+    render_hash,
+)
+from dataset_toolkits.voxel_sampling import sample_voxel_rows
+from dataset_toolkits.material_objects.voxelize import (
+    load_material_annotations,
+    voxel_outputs_are_complete,
+)
 
 
 def get_first_directory(path):
@@ -39,8 +54,260 @@ def need_process(key):
     return key in opt.field or opt.field == ["all"]
 
 
+def feature_file_is_complete(output_dir, model, sha256):
+    feature_path = os.path.join(output_dir, "features", model, f"{sha256}.npz")
+    material_path = os.path.join(
+        output_dir, "voxels", f"{sha256}_with_materials.npz"
+    )
+    try:
+        if model != DINO_MODEL:
+            return False
+        with np.load(feature_path, allow_pickle=False) as feature_archive:
+            if not {
+                "indices",
+                "patchtokens",
+                "voxel_row_indices",
+                "model_name",
+                "model_repository",
+                "render_sha256",
+            } <= set(feature_archive.files):
+                return False
+            indices = feature_archive["indices"]
+            patchtokens = feature_archive["patchtokens"]
+            voxel_rows = feature_archive["voxel_row_indices"]
+            stored_model = feature_archive["model_name"]
+            stored_repository = feature_archive["model_repository"]
+            stored_render = feature_archive["render_sha256"]
+        with np.load(material_path, allow_pickle=False) as material_archive:
+            voxel_data = material_archive["voxel_data"]
+            surface_mask = material_archive["is_surface"]
+        render_dir = os.path.join(output_dir, "renders", sha256)
+        with open(
+            os.path.join(render_dir, "transforms.json"), "r", encoding="utf-8"
+        ) as stream:
+            render_metadata = json.load(stream)
+        segment_order = render_metadata["mesh"]["segment_keys"]
+        expected_render = render_hash(render_dir, render_metadata["frames"])
+
+        full_count = len(voxel_data)
+        if full_count == 0:
+            return False
+        expected_count = min(full_count, 72_000)
+        if (
+            indices.dtype != np.dtype(np.uint8)
+            or indices.shape != (expected_count, 3)
+            or patchtokens.dtype != np.dtype(np.float16)
+            or patchtokens.ndim != 2
+            or patchtokens.shape[0] != expected_count
+            or patchtokens.shape[1] != DINO_FEATURE_DIM
+            or not np.isfinite(patchtokens).all()
+            or voxel_rows.dtype != np.dtype(np.int32)
+            or voxel_rows.shape != (expected_count,)
+            or np.any(voxel_rows < 0)
+            or np.any(voxel_rows >= full_count)
+            or expected_count > 1
+            and np.any(np.diff(voxel_rows) <= 0)
+            or stored_model.shape != ()
+            or str(stored_model.item()) != model
+            or stored_repository.shape != ()
+            or str(stored_repository.item()) != DINO_REPOSITORY
+            or stored_render.shape != ()
+            or str(stored_render.item()) != expected_render
+        ):
+            return False
+        if full_count <= 72_000 and not np.array_equal(
+            voxel_rows, np.arange(full_count, dtype=np.int32)
+        ):
+            return False
+
+        full_coords = np.floor(
+            (
+                np.column_stack(
+                    (voxel_data["x"], voxel_data["y"], voxel_data["z"])
+                ).astype(np.float64)
+                + 0.5
+            )
+            * 64
+        ).astype(np.int64)
+        if not np.array_equal(indices, full_coords[voxel_rows].astype(np.uint8)):
+            return False
+
+        expected_rows = sample_voxel_rows(
+            full_coords,
+            voxel_data["segment_id"],
+            surface_mask,
+            segment_order,
+        )
+        return bool(np.array_equal(voxel_rows, expected_rows.astype(np.int32)))
+    except (OSError, RuntimeError, ValueError, KeyError, zipfile.BadZipFile):
+        return False
+
+
+def normalized_mesh_is_complete(render_dir, record):
+    if not isinstance(record, dict):
+        return False
+    vertex_count = record.get("vertex_count")
+    triangle_count = record.get("triangle_count")
+    segment_keys = record.get("segment_keys")
+    segment_keys_sha256 = record.get("segment_keys_sha256")
+    expected_sha256 = record.get("sha256")
+    if (
+        record.get("file_path") != "mesh.ply"
+        or type(vertex_count) is not int
+        or vertex_count < 3
+        or type(triangle_count) is not int
+        or triangle_count < 1
+        or not isinstance(segment_keys, list)
+        or not segment_keys
+        or len(set(segment_keys)) != len(segment_keys)
+        or not all(isinstance(key, str) and key for key in segment_keys)
+        or segment_keys != sorted(segment_keys)
+        or not isinstance(segment_keys_sha256, str)
+        or len(segment_keys_sha256) != 64
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+    ):
+        return False
+    path = os.path.join(render_dir, "mesh.ply")
+    try:
+        with open(path, "rb") as stream:
+            header = stream.read(65536)
+        marker = b"end_header\n"
+        marker_offset = header.find(marker)
+        if marker_offset < 0:
+            return False
+        header_size = marker_offset + len(marker)
+        expected_segment_keys_sha256 = hashlib.sha256(
+            json.dumps(
+                segment_keys, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if segment_keys_sha256 != expected_segment_keys_sha256:
+            return False
+        expected_header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            "comment exact composed render geometry in normalized object coordinates\n"
+            f"comment segment_keys_sha256 {segment_keys_sha256}\n"
+            f"element vertex {vertex_count}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            f"element face {triangle_count}\n"
+            "property list uchar int vertex_indices\n"
+            "property int segment_index\n"
+            "end_header\n"
+        ).encode("ascii")
+        expected_size = header_size + vertex_count * 12 + triangle_count * 17
+        if header[:header_size] != expected_header or os.path.getsize(path) != expected_size:
+            return False
+        face_dtype = np.dtype(
+            [
+                ("count", "u1"),
+                ("indices", "<i4", (3,)),
+                ("segment_index", "<i4"),
+            ]
+        )
+        vertices = np.memmap(
+            path,
+            mode="r",
+            dtype="<f4",
+            offset=header_size,
+            shape=(vertex_count, 3),
+        )
+        faces = np.memmap(
+            path,
+            mode="r",
+            dtype=face_dtype,
+            offset=header_size + vertex_count * 12,
+            shape=(triangle_count,),
+        )
+        valid_payload = (
+            np.isfinite(vertices).all()
+            and not np.any(vertices < -0.500001)
+            and not np.any(vertices > 0.500001)
+            and not np.any(faces["count"] != 3)
+            and int(faces["indices"].min()) >= 0
+            and int(faces["indices"].max()) < vertex_count
+            and np.array_equal(
+                np.unique(faces["segment_index"]),
+                np.arange(len(segment_keys), dtype=np.int32),
+            )
+        )
+        del faces
+        del vertices
+        if not valid_payload:
+            return False
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest() == expected_sha256
+    except OSError:
+        return False
+
+
+def render_is_complete(
+    render_dir, expected_views=150, expected_resolution=512, strict=False
+):
+    manifest_path = os.path.join(render_dir, "transforms.json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        if not isinstance(manifest, dict):
+            return False
+        frames = manifest["frames"]
+        if not isinstance(frames, list) or not frames:
+            return False
+        if strict:
+            settings = manifest.get("render_settings")
+            mesh = manifest.get("mesh")
+            normalization = manifest.get("normalization")
+            if (
+                not isinstance(settings, dict)
+                or settings.get("resolution") != expected_resolution
+                or settings.get("num_views") != expected_views
+                or settings.get("transparent_background") is not True
+                or not isinstance(normalization, dict)
+                or not isinstance(mesh, dict)
+                or not normalized_mesh_is_complete(render_dir, mesh)
+                or len(frames) != expected_views
+            ):
+                return False
+        root = os.path.realpath(render_dir)
+        for index, frame in enumerate(frames):
+            if not isinstance(frame, dict):
+                return False
+            relative_path = frame.get("file_path")
+            if not isinstance(relative_path, str) or not relative_path:
+                return False
+            if strict and relative_path != f"{index:03d}.png":
+                return False
+            path = os.path.realpath(os.path.join(root, relative_path))
+            if os.path.commonpath((root, path)) != root or not os.path.isfile(path):
+                return False
+            if not strict:
+                continue
+            with open(path, "rb") as stream:
+                header = stream.read(26)
+                stream.seek(-12, os.SEEK_END)
+                footer = stream.read(12)
+            if (
+                header[:8] != b"\x89PNG\r\n\x1a\n"
+                or header[12:16] != b"IHDR"
+                or int.from_bytes(header[16:20], "big") != expected_resolution
+                or int.from_bytes(header[20:24], "big") != expected_resolution
+                or header[24:26] != b"\x08\x06"
+                or footer[4:8] != b"IEND"
+            ):
+                return False
+        return True
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
 if __name__ == "__main__":
-    dataset_utils = importlib.import_module(f"dataset_toolkits.datasets.{sys.argv[1]}")
+    dataset_utils = {"ABO": ABO, "allmats": allmats, "simready": simready}[sys.argv[1]]
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -87,6 +354,39 @@ if __name__ == "__main__":
         print("Loading previous metadata...")
         metadata = pd.read_csv(os.path.join(opt.output_dir, "metadata.csv"))
 
+        # Include newly added assets and keep the processing status of existing ones.
+        if sys.argv[1] == "allmats":
+            fresh_options = dict(opt)
+            fresh_options["output_dir"] = None
+            fresh_metadata = dataset_utils.get_metadata(**fresh_options)
+            metadata.set_index("sha256", inplace=True)
+            fresh_metadata.set_index("sha256", inplace=True)
+            if "augmentation_index" in metadata.columns:
+                augmentation_rows = metadata[
+                    pd.to_numeric(metadata["augmentation_index"], errors="coerce")
+                    .fillna(0)
+                    .gt(0)
+                ].copy()
+            else:
+                augmentation_rows = metadata.iloc[0:0].copy()
+            state_columns = [
+                column
+                for column in metadata.columns
+                if column
+                in {"rendered", "voxelized", "num_voxels", "cond_rendered"}
+                or column.startswith(("feature_", "latent_", "ss_latent_"))
+            ]
+            shared = fresh_metadata.index.intersection(metadata.index)
+            for column in state_columns:
+                if column not in fresh_metadata.columns:
+                    fresh_metadata[column] = 0 if column == "num_voxels" else False
+                fresh_metadata.loc[shared, column] = metadata.loc[shared, column]
+            if not augmentation_rows.empty:
+                fresh_metadata = pd.concat(
+                    (fresh_metadata, augmentation_rows), axis=0, sort=False
+                )
+            metadata = fresh_metadata
+
         # Check if class and split information needs to be updated
         requires_class_update = (
             "class" not in metadata.columns or opt.force_update_class_split
@@ -102,7 +402,8 @@ if __name__ == "__main__":
                 fresh_metadata = dataset_utils.get_metadata(**opt)
 
                 # Set index on sha256 for both DataFrames
-                metadata.set_index("sha256", inplace=True)
+                if metadata.index.name != "sha256":
+                    metadata.set_index("sha256", inplace=True)
                 fresh_metadata.set_index("sha256", inplace=True)
 
                 # Update class information if needed
@@ -124,11 +425,13 @@ if __name__ == "__main__":
                         metadata["class"] = "unknown"
                     if "split" not in metadata.columns:
                         metadata["split"] = "train"
-                    metadata.set_index("sha256", inplace=True)
+                    if metadata.index.name != "sha256":
+                        metadata.set_index("sha256", inplace=True)
                 else:
                     raise e
         else:
-            metadata.set_index("sha256", inplace=True)
+            if metadata.index.name != "sha256":
+                metadata.set_index("sha256", inplace=True)
     else:
         # Create new metadata with all required information
         print("Creating new metadata...")
@@ -342,41 +645,52 @@ if __name__ == "__main__":
                     os.path.join(opt.output_dir, "merged_records", f"{timestamp}_{f}"),
                 )
 
+    voxel_annotations = None
+    if opt.from_file and sys.argv[1] == "allmats" and need_process("voxelized"):
+        voxel_annotations = load_material_annotations(
+            os.path.join(opt.output_dir, "material_annotations.json")
+        )
+
     # build metadata from files
     if opt.from_file:
-        with (
-            ThreadPoolExecutor(max_workers=os.cpu_count()) as executor,
-            tqdm(total=len(metadata), desc="Building metadata") as pbar,
-        ):
+        with ThreadPoolExecutor(
+            max_workers=min(32, os.cpu_count() or 1)
+        ) as executor, tqdm(
+            total=len(metadata), desc="Building metadata"
+        ) as pbar:
 
             def worker(sha256):
                 try:
-                    if (
-                        need_process("rendered")
-                        and metadata.loc[sha256, "rendered"] == False
-                        and os.path.exists(
-                            os.path.join(
-                                opt.output_dir, "renders", sha256, "transforms.json"
-                            )
+                    if need_process("rendered"):
+                        metadata.loc[sha256, "rendered"] = render_is_complete(
+                            os.path.join(opt.output_dir, "renders", sha256),
+                            strict=sys.argv[1] == "allmats",
                         )
-                    ):
-                        metadata.loc[sha256, "rendered"] = True
-                    if (
-                        need_process("voxelized")
-                        and metadata.loc[sha256, "rendered"] == True
-                        and metadata.loc[sha256, "voxelized"] == False
-                        and os.path.exists(
-                            os.path.join(opt.output_dir, "voxels", f"{sha256}.ply")
-                        )
-                    ):
-                        try:
-                            pts = utils3d.io.read_ply(
-                                os.path.join(opt.output_dir, "voxels", f"{sha256}.ply")
-                            )[0]
-                            metadata.loc[sha256, "voxelized"] = True
-                            metadata.loc[sha256, "num_voxels"] = len(pts)
-                        except Exception as e:
-                            pass
+                    if need_process("voxelized"):
+                        valid, count = False, 0
+                        if metadata.loc[sha256, "rendered"] == True:
+                            if sys.argv[1] == "allmats":
+                                valid, count = voxel_outputs_are_complete(
+                                    opt.output_dir,
+                                    str(sha256),
+                                    str(metadata.loc[sha256, "local_path"]),
+                                    str(metadata.loc[sha256, "dataset"]),
+                                    voxel_annotations,
+                                )
+                            else:
+                                try:
+                                    pts = utils3d.io.read_ply(
+                                        os.path.join(
+                                            opt.output_dir,
+                                            "voxels",
+                                            f"{sha256}.ply",
+                                        )
+                                    )[0]
+                                    valid, count = True, len(pts)
+                                except (OSError, ValueError):
+                                    pass
+                        metadata.loc[sha256, "voxelized"] = valid
+                        metadata.loc[sha256, "num_voxels"] = count
                     if (
                         need_process("cond_rendered")
                         and metadata.loc[sha256, "cond_rendered"] == False
@@ -391,18 +705,25 @@ if __name__ == "__main__":
                     ):
                         metadata.loc[sha256, "cond_rendered"] = True
                     for model in image_models:
-                        if (
-                            need_process(f"feature_{model}")
-                            and metadata.loc[sha256, f"feature_{model}"] == False
-                            and metadata.loc[sha256, "rendered"] == True
-                            and metadata.loc[sha256, "voxelized"] == True
-                            and os.path.exists(
-                                os.path.join(
-                                    opt.output_dir, "features", model, f"{sha256}.npz"
+                        if need_process(f"feature_{model}"):
+                            if sys.argv[1] == "allmats":
+                                feature_complete = feature_file_is_complete(
+                                    opt.output_dir, model, sha256
                                 )
+                            else:
+                                feature_complete = os.path.exists(
+                                    os.path.join(
+                                        opt.output_dir,
+                                        "features",
+                                        model,
+                                        f"{sha256}.npz",
+                                    )
+                                )
+                            metadata.loc[sha256, f"feature_{model}"] = bool(
+                                metadata.loc[sha256, "rendered"] == True
+                                and metadata.loc[sha256, "voxelized"] == True
+                                and feature_complete
                             )
-                        ):
-                            metadata.loc[sha256, f"feature_{model}"] = True
                     for model in latent_models:
                         if (
                             need_process(f"latent_{model}")
@@ -459,10 +780,21 @@ if __name__ == "__main__":
         print("Updating metadata to reflect actual files on disk...")
         for model in image_models:
             for sha256 in metadata.index:
-                actual_exists = os.path.exists(
-                    os.path.join(opt.output_dir, "features", model, f"{sha256}.npz")
+                if sys.argv[1] == "allmats":
+                    feature_complete = feature_file_is_complete(
+                        opt.output_dir, model, sha256
+                    )
+                else:
+                    feature_complete = os.path.exists(
+                        os.path.join(
+                            opt.output_dir, "features", model, f"{sha256}.npz"
+                        )
+                    )
+                metadata.loc[sha256, f"feature_{model}"] = bool(
+                    metadata.loc[sha256, "rendered"] == True
+                    and metadata.loc[sha256, "voxelized"] == True
+                    and feature_complete
                 )
-                metadata.loc[sha256, f"feature_{model}"] = actual_exists
 
         for model in latent_models:
             for sha256 in metadata.index:

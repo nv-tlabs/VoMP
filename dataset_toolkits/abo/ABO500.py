@@ -167,9 +167,6 @@ def foreach_instance(
     metadata, output_dir, func, max_workers=None, desc="Processing objects"
 ) -> pd.DataFrame:
     """Process each instance in the metadata."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-    from tqdm import tqdm
 
     # Convert to list of records
     metadata_records = metadata.to_dict("records")

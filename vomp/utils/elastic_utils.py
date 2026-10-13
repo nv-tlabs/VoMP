@@ -19,6 +19,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 class MemoryController:
@@ -130,8 +131,6 @@ class LinearMemoryController(MemoryController):
         # self._visualize()
 
     def _visualize(self):
-        import matplotlib.pyplot as plt
-
         memory_usage = self._memory[: self._buffer_length]
         input_size = self._input_size[: self._buffer_length]
         mem_ratio = self._mem_ratio[: self._buffer_length]

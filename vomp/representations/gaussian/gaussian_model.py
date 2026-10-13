@@ -20,11 +20,17 @@ from .general_utils import inverse_sigmoid, strip_symmetric, build_scaling_rotat
 import utils3d
 import kaolin
 
+try:
+    from e3nn import o3
+except ImportError:
+    o3 = None
+
 
 def transform_shs(shs_feat, rotation_matrix):
     try:
+        if o3 is None:
+            raise ImportError("e3nn is required to rotate spherical harmonics")
         # Solution from: https://github.com/graphdeco-inria/gaussian-splatting/issues/176
-        from e3nn import o3
 
         ## rotate shs
         device = shs_feat.device

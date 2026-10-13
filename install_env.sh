@@ -1,5 +1,6 @@
 #!/bin/bash -e
 
+set -o errexit
 set -o nounset
 set -o pipefail
 
@@ -33,6 +34,27 @@ if [ $# -gt "2" ]; then
     echo -e "$USAGE"
     exit 1
 fi
+
+case "$CUDA_VERSION" in
+  11.8|11.8.*)
+    TORCH_CUDA_VERSION="11.8"
+    TORCH_CUDA_TAG="cu118"
+    FLASH_CUDA_TAG="cu118"
+    SPCONV_PACKAGE="spconv-cu118"
+    ;;
+  12.1|12.1.*)
+    TORCH_CUDA_VERSION="12.1"
+    TORCH_CUDA_TAG="cu121"
+    # FlashAttention uses its CUDA 12.2 build for CUDA 12.x.
+    FLASH_CUDA_TAG="cu122"
+    SPCONV_PACKAGE="spconv-cu120"
+    ;;
+  *)
+    echo "This PyTorch 2.4.0 setup supports CUDA 11.8 or 12.1. Set CUDA_VERSION accordingly."
+    exit 1
+    ;;
+esac
+TORCH_INDEX_URL="https://download.pytorch.org/whl/${TORCH_CUDA_TAG}"
 
 AUTOCONFIRM="NO"
 if [ $# -ge 2 ]; then
@@ -71,34 +93,15 @@ ask_yes_no() {
     fi
 }
 
-echo "--------------------------------------------------------------------"
-echo -e "${GREEN}Installing System-Wide Dependencies${NOCOLOR}"
-echo "--------------------------------------------------------------------"
-
-if ask_yes_no "Ok to install OpenGL (libglib2.0-dev libgl) required only if you use material visualization GUI?"; then
-    echo -e "${GREEN}...Running OpenGL installation${NOCOLOR}"
-    sudo apt-get install -y libglib2.0-dev libgl || { echo -e "${RED}Failed to install OpenGL dependencies${NOCOLOR}"; exit 1; }
-    conda install -c conda-forge mesa-libgl-devel-cos7-x86_64 -y || { echo -e "${RED}Failed to install mesa-libgl${NOCOLOR}"; exit 1; }
-else
-    echo -e "${RED}...Skipping OpenGL installation${NOCOLOR}"
-fi
-
-if ask_yes_no "Ok to install EGL (libegl1) required only if you use material visualization GUI without a display?"; then
-    echo -e "${GREEN}...Running EGL installation${NOCOLOR}"
-    sudo apt-get install -y libegl1 || { echo -e "${RED}Failed to install EGL${NOCOLOR}"; exit 1; }
-else
-    echo -e "${RED}...Skipping EGL installation${NOCOLOR}"
-fi
-
 # Create and activate conda environment
 eval "$(conda shell.bash hook)"
 
 # Finds the path of the environment if the environment already exists
 CONDA_ENV_PATH=$(conda env list | sed -E -n "s/^${CONDA_ENV}[[:space:]]+\*?[[:space:]]*(.*)$/\1/p")
 if [ -z "${CONDA_ENV_PATH}" ]; then
-  if ask_yes_no "Conda environment '${CONDA_ENV}' not found. Create new environment with Python 3.10?"; then
+  if ask_yes_no "Conda environment '${CONDA_ENV}' not found. Create new environment with Python 3.11?"; then
     echo -e "${GREEN}Creating conda environment '${CONDA_ENV}'${NOCOLOR}"
-    conda create --name "${CONDA_ENV}" -y python=3.10 || { echo -e "${RED}Failed to create conda environment${NOCOLOR}"; exit 1; }
+    conda create --name "${CONDA_ENV}" -y python=3.11 || { echo -e "${RED}Failed to create conda environment${NOCOLOR}"; exit 1; }
   else
     echo -e "${RED}Environment creation cancelled. Exiting.${NOCOLOR}"
     exit 1
@@ -113,17 +116,39 @@ else
   fi
 fi
 conda activate "$CONDA_ENV"
+python -c 'import sys; assert sys.version_info[:2] == (3, 11), "VoMP requires Python 3.11"'
+
+echo "--------------------------------------------------------------------"
+echo -e "${GREEN}Installing System-Wide Dependencies${NOCOLOR}"
+echo "--------------------------------------------------------------------"
+
+if ask_yes_no "Ok to install OpenGL (libglib2.0-dev libgl1) required only if you use material visualization GUI?"; then
+    echo -e "${GREEN}...Running OpenGL installation${NOCOLOR}"
+    sudo apt-get install -y libglib2.0-dev libgl1 || { echo -e "${RED}Failed to install OpenGL dependencies${NOCOLOR}"; exit 1; }
+    conda install -c conda-forge mesa-libgl-devel-cos7-x86_64 -y || { echo -e "${RED}Failed to install mesa-libgl${NOCOLOR}"; exit 1; }
+else
+    echo -e "${RED}...Skipping OpenGL installation${NOCOLOR}"
+fi
+
+if ask_yes_no "Ok to install EGL (libegl1) required only if you use material visualization GUI without a display?"; then
+    echo -e "${GREEN}...Running EGL installation${NOCOLOR}"
+    sudo apt-get install -y libegl1 || { echo -e "${RED}Failed to install EGL${NOCOLOR}"; exit 1; }
+else
+    echo -e "${RED}...Skipping EGL installation${NOCOLOR}"
+fi
+
 
 if ask_yes_no "Install/reinstall NVIDIA CUDA ${CUDA_VERSION} in conda environment? (Skip if already installed)"; then
   echo -e "${GREEN}...Installing NVIDIA Cuda (in Conda env; keeping systems settings intact)${NOCOLOR}"
   conda install -y cuda="${CUDA_VERSION}" -c nvidia/label/cuda-"${CUDA_VERSION}" || { echo -e "${RED}Failed to install CUDA${NOCOLOR}"; exit 1; }
   conda install -y cmake ninja cuda-toolkit -c nvidia/label/cuda-"${CUDA_VERSION}" || { echo -e "${RED}Failed to install build tools${NOCOLOR}"; exit 1; }
+  export CUDA_HOME="$CONDA_PREFIX"
 else
   echo -e "${RED}...Skipping CUDA installation${NOCOLOR}"
 fi
 
 echo -e "${GREEN}...Setting up CUDA environment${NOCOLOR}"
-export CUDA_HOME=$CONDA_PREFIX
+export CUDA_HOME=${CUDA_HOME:-$CONDA_PREFIX}
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 conda env config vars set CUDA_HOME="$CUDA_HOME"
@@ -135,33 +160,33 @@ echo -e "${GREEN}Installing Pip/Conda Packages${NOCOLOR}"
 echo "--------------------------------------------------------------------"
 
 echo -e "${GREEN}...Installing utilities${NOCOLOR}"
-pip install --upgrade pip wheel setuptools pytest || { echo -e "${RED}Failed to install pip utilities${NOCOLOR}"; exit 1; }
-
-if ask_yes_no "Install/reinstall torch-tensorrt? (Skip if already installed)"; then
-  echo -e "${GREEN}...Installing torch-tensorrt${NOCOLOR}"
-  if [ "$CUDA_VERSION" == "11.8.0" ]; then
-    pip install -U torch-tensorrt==2.4.0 --no-deps --index-url https://download.pytorch.org/whl/cu118 || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
-  else
-    pip install -U torch-tensorrt==2.4.0 --no-deps || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
-  fi
-else
-  echo -e "${RED}...Skipping torch-tensorrt installation${NOCOLOR}"
-fi
+pip install --upgrade pip wheel setuptools pytest packaging ninja || { echo -e "${RED}Failed to install pip utilities${NOCOLOR}"; exit 1; }
 
 if ask_yes_no "Install/reinstall PyTorch 2.4.0 and related packages? (Skip if already installed with correct version)"; then
   echo -e "${GREEN}...Installing PyTorch${NOCOLOR}"
-  if [ "$CUDA_VERSION" == "11.8.0" ]; then
-    pip install torch==2.4.0 torchvision==0.19.0 xformers==0.0.27.post2 --index-url https://download.pytorch.org/whl/cu118 || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
-  else
-    pip install torch==2.4.0 torchvision==0.19.0 xformers==0.0.27.post2 || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
-  fi
+  pip install torch==2.4.0 torchvision==0.19.0 xformers==0.0.27.post2 --index-url "$TORCH_INDEX_URL" || { echo -e "${RED}Failed to install PyTorch${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}...Skipping PyTorch installation${NOCOLOR}"
 fi
 
+python - "$TORCH_CUDA_VERSION" <<'PYTHON'
+import sys
+import torch
+
+if torch.__version__.split("+")[0] != "2.4.0" or torch.version.cuda != sys.argv[1]:
+    raise SystemExit(f"Install PyTorch 2.4.0 with CUDA {sys.argv[1]} before continuing.")
+PYTHON
+
+if ask_yes_no "Install/reinstall torch-tensorrt? (Optional; only needed for use_trt=True)"; then
+  echo -e "${GREEN}...Installing torch-tensorrt${NOCOLOR}"
+  pip install "torch-tensorrt==2.4.0+${TORCH_CUDA_TAG}" --extra-index-url "$TORCH_INDEX_URL" || { echo -e "${RED}Failed to install torch-tensorrt${NOCOLOR}"; exit 1; }
+else
+  echo -e "${RED}...Skipping torch-tensorrt installation${NOCOLOR}"
+fi
+
 if ask_yes_no "Install/reinstall diff-gaussian-rasterization? (Skip if already installed)"; then
   echo -e "${GREEN}...Installing diff-gaussian-rasterization${NOCOLOR}"
-  pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d --no-build-isolation || { echo -e "${RED}Failed to install diff-gaussian-rasterization${NOCOLOR}"; exit 1; }
+  pip install --no-build-isolation git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d || { echo -e "${RED}Failed to install diff-gaussian-rasterization${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}...Skipping diff-gaussian-rasterization installation${NOCOLOR}"
 fi
@@ -170,120 +195,37 @@ fi
 echo -e "${GREEN}...Installing flash_attn${NOCOLOR}"
 if ask_yes_no "Install prebuilt flash_attn binary (faster) instead of building from source?"; then
   echo -e "${GREEN}Installing prebuilt flash_attn binary${NOCOLOR}"
-  pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl --no-build-isolation || { echo -e "${RED}Failed to install prebuilt flash_attn${NOCOLOR}"; exit 1; }
+  pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+${FLASH_CUDA_TAG}torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" --no-build-isolation || { echo -e "${RED}Failed to install prebuilt flash_attn${NOCOLOR}"; exit 1; }
 else
   echo -e "${GREEN}Building flash_attn from source${NOCOLOR}"
   pip install flash_attn==2.5.9.post1 --no-build-isolation || { echo -e "${RED}Failed to build flash_attn from source${NOCOLOR}"; exit 1; }
 fi
 
 if ask_yes_no "Install/reinstall spconv? (Skip if already installed with correct CUDA version)"; then
-  if [[ "$CUDA_VERSION" == 11.8* ]] || [[ "$CUDA_VERSION" == 11* ]]; then
-    echo -e "${GREEN}Installing spconv for CUDA 11.x${NOCOLOR}"
-    pip install spconv-cu118 || { echo -e "${RED}Failed to install spconv-cu118${NOCOLOR}"; exit 1; }
-  elif [[ "$CUDA_VERSION" == 12.0* ]] || [[ "$CUDA_VERSION" == 12* ]]; then
-    echo -e "${GREEN}Installing spconv for CUDA 12.x${NOCOLOR}"
-    pip install spconv-cu120 || { echo -e "${RED}Failed to install spconv-cu120${NOCOLOR}"; exit 1; }
-  else
-    echo -e "${RED}Warning: No prebuilt spconv wheel for CUDA version $CUDA_VERSION. Please install spconv manually.${NOCOLOR}"
-  fi
+  pip install "${SPCONV_PACKAGE}==2.3.8" || { echo -e "${RED}Failed to install spconv${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}...Skipping spconv installation${NOCOLOR}"
 fi
 
 if ask_yes_no "Install/reinstall Kaolin 0.18.0? (Skip if already installed with correct CUDA version)"; then
   echo -e "${GREEN}...Installing Kaolin${NOCOLOR}"
-  # Extract CUDA version digits (e.g., 11.8.0 -> 118, 12.0.1 -> 120)
-  KAOLIN_CUDA_VER=$(echo "$CUDA_VERSION" | awk -F. '{printf "%s%s", $1, $2}')
-  pip install kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu"${KAOLIN_CUDA_VER}".html || { echo -e "${RED}Failed to install Kaolin${NOCOLOR}"; exit 1; }
+  pip install kaolin==0.18.0 -f "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_${TORCH_CUDA_TAG}.html" || { echo -e "${RED}Failed to install Kaolin${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}...Skipping Kaolin installation${NOCOLOR}"
 fi
 
 if ask_yes_no "Install base inference requirements from requirements_inference.txt?"; then
   echo -e "${GREEN}Installing from requirements_inference.txt${NOCOLOR}"
-  pip install -r requirements_inference.txt || { echo -e "${RED}Failed to install from requirements_inference.txt${NOCOLOR}"; exit 1; }
+  pip install --no-build-isolation -r requirements_inference.txt || { echo -e "${RED}Failed to install from requirements_inference.txt${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}Skipping base inference requirements${NOCOLOR}"
 fi
 
 if ask_yes_no "Install dev requirements from requirements_dev.txt (only required for training or finetuning)?"; then
   echo -e "${GREEN}Installing from requirements_dev.txt${NOCOLOR}"
-  pip install -r requirements_dev.txt || { echo -e "${RED}Failed to install from requirements_dev.txt${NOCOLOR}"; exit 1; }
+  pip install --no-build-isolation -r requirements_dev.txt || { echo -e "${RED}Failed to install from requirements_dev.txt${NOCOLOR}"; exit 1; }
 else
   echo -e "${RED}Skipping dev requirements${NOCOLOR}"
-fi
-
-echo "--------------------------------------------------------------------"
-echo -e "${GREEN}Setting Up Blender${NOCOLOR}"
-echo "--------------------------------------------------------------------"
-
-BLENDER_PATH="./blender-3.0.1-linux-x64/blender"
-
-# Check if Blender is already installed
-if [ -f "$BLENDER_PATH" ]; then
-  echo -e "${GREEN}Blender already found at $BLENDER_PATH${NOCOLOR}"
-  echo -e "${GREEN}Setting BLENDER_BIN environment variable...${NOCOLOR}"
-  conda env config vars set BLENDER_BIN="$BLENDER_PATH"
-  echo -e "${GREEN}Blender path configured successfully!${NOCOLOR}"
-elif ask_yes_no "Auto-install Blender 3.0.1 for material visualization? (Required for mesh material estimation)"; then
-  echo -e "${GREEN}Installing Blender system dependencies...${NOCOLOR}"
-  if ask_yes_no "Ok to update apt-get?"; then
-    sudo apt-get update || { echo -e "${RED}Failed to update apt-get${NOCOLOR}"; exit 1; }
-  else
-    echo -e "${RED}...Skipping apt-get update${NOCOLOR}"
-    echo "You can update them manually with: sudo apt-get update"
-  fi
-  
-  if ask_yes_no "Ok to install system-wide dependencies for Blender (libxrender1 libxi6 libxkbcommon-x11-0 libsm6)?"; then
-    sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6 || { echo -e "${RED}Failed to install Blender dependencies${NOCOLOR}"; exit 1; }
-  else
-    echo -e "${RED}...Skipping Blender system dependencies${NOCOLOR}"
-    echo "You can install them manually with: sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6"
-  fi
-  
-  echo -e "${GREEN}Downloading Blender 3.0.1...${NOCOLOR}"
-  if [ ! -f "blender-3.0.1-linux-x64.tar.xz" ]; then
-    wget https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz || { echo -e "${RED}Failed to download Blender${NOCOLOR}"; exit 1; }
-  else
-    echo -e "${GREEN}Blender archive already downloaded.${NOCOLOR}"
-  fi
-  
-  echo -e "${GREEN}Extracting Blender...${NOCOLOR}"
-  if [ ! -d "blender-3.0.1-linux-x64" ]; then
-    tar -xf blender-3.0.1-linux-x64.tar.xz || { echo -e "${RED}Failed to extract Blender${NOCOLOR}"; exit 1; }
-  else
-    echo -e "${GREEN}Blender already extracted.${NOCOLOR}"
-  fi
-  
-  if [ -f "$BLENDER_PATH" ]; then
-    echo -e "${GREEN}Setting BLENDER_BIN environment variable to: $BLENDER_PATH${NOCOLOR}"
-    conda env config vars set BLENDER_BIN="$BLENDER_PATH"
-    echo -e "${GREEN}Blender installed and configured successfully!${NOCOLOR}"
-    echo -e "${GREEN}Note: You may need to reactivate the conda environment for the change to take effect.${NOCOLOR}"
-  else
-    echo -e "${RED}Error: Blender installation failed!${NOCOLOR}"
-    exit 1
-  fi
-elif ask_yes_no "Configure custom Blender path instead?"; then
-  echo "Default Blender path: $BLENDER_PATH"
-  read -p "Enter Blender executable path (or press Enter for default): " CUSTOM_BLENDER_PATH
-  
-  if [ ! -z "$CUSTOM_BLENDER_PATH" ]; then
-    BLENDER_PATH="$CUSTOM_BLENDER_PATH"
-  fi
-  
-  if [ -f "$BLENDER_PATH" ]; then
-    echo -e "${GREEN}Setting BLENDER_BIN environment variable to: $BLENDER_PATH${NOCOLOR}"
-    conda env config vars set BLENDER_BIN="$BLENDER_PATH"
-    echo -e "${GREEN}Blender path configured successfully!${NOCOLOR}"
-    echo -e "${GREEN}Note: You may need to reactivate the conda environment for the change to take effect.${NOCOLOR}"
-  else
-    echo -e "${RED}Warning: Blender executable not found at $BLENDER_PATH${NOCOLOR}"
-    echo "You can manually set it later with: conda env config vars set BLENDER_BIN=<path>"
-  fi
-else
-  echo -e "${RED}Skipping Blender setup.${NOCOLOR} You can install it later and set the path with:"
-  echo "  conda env config vars set BLENDER_BIN=<path>"
 fi
 
 echo "--------------------------------------------------------------------"

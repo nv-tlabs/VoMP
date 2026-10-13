@@ -16,6 +16,7 @@
 import torch
 import torch.nn as nn
 from .. import SparseTensor
+import torchsparse
 
 
 class SparseConv3d(nn.Module):
@@ -30,8 +31,6 @@ class SparseConv3d(nn.Module):
         indice_key=None,
     ):
         super(SparseConv3d, self).__init__()
-        if "torchsparse" not in globals():
-            import torchsparse
         self.conv = torchsparse.nn.Conv3d(
             in_channels, out_channels, kernel_size, stride, 0, dilation, bias
         )
@@ -63,8 +62,6 @@ class SparseInverseConv3d(nn.Module):
         indice_key=None,
     ):
         super(SparseInverseConv3d, self).__init__()
-        if "torchsparse" not in globals():
-            import torchsparse
         self.conv = torchsparse.nn.Conv3d(
             in_channels,
             out_channels,

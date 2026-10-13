@@ -17,6 +17,11 @@ import torch.nn as nn
 
 # FP16 utils
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.optim.lr_scheduler import LambdaLR
+import os
+import torch
+import json
+from typing import Dict, Any, Optional
 
 
 def make_master_params(model_params):
@@ -78,7 +83,6 @@ def zero_grad(model_params):
 
 
 # LR Schedulers
-from torch.optim.lr_scheduler import LambdaLR
 
 
 class LinearWarmupLRScheduler(LambdaLR):
@@ -92,12 +96,6 @@ class LinearWarmupLRScheduler(LambdaLR):
         if current_step < self.warmup_steps:
             return float(current_step + 1) / self.warmup_steps
         return 1.0
-
-
-import os
-import torch
-import json
-from typing import Dict, Any, Optional
 
 
 def get_optimizer(config, params):

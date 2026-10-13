@@ -16,6 +16,7 @@
 import numpy as np
 import warp as wp
 from vomp.inference.utils import MaterialUpsampler
+import matplotlib.pyplot as plt
 
 
 def load_material_data(npz_path: str):
@@ -100,8 +101,6 @@ def apply_spatially_varying_materials(sim, npz_path: str, k_neighbors: int = 1):
 
 
 def visualize_material_distribution(sim, material_stats: dict, output_path: str = None):
-    import matplotlib.pyplot as plt
-
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     axes[0].hist(

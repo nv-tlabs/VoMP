@@ -31,6 +31,7 @@ from PIL import Image
 # Add current directory to path to import dataset modules
 sys.path.insert(0, os.path.dirname(__file__))
 import ABO500 as dataset_utils
+import traceback
 
 torch.set_grad_enabled(False)
 
@@ -215,7 +216,6 @@ def extract_features(
 
     except Exception as e:
         print(f"Error processing {sha256}: {e}")
-        import traceback
 
         traceback.print_exc()
         return {"sha256": sha256, f"feature_{feature_name}": False}

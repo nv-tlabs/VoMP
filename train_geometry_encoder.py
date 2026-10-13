@@ -18,20 +18,20 @@ import sys
 import json
 import glob
 import argparse
-from easydict import EasyDict as edict
+from pathlib import Path
 
 import torch
 import torch.multiprocessing as mp
 import numpy as np
 import random
-from safetensors.torch import load_file
-
-from vomp.datasets.sparse_voxel_materials import SparseVoxelMaterials
-from vomp.models.geometry_encoder import ElasticGeometryEncoder, ElasticSLatVoxelDecoder
-from vomp.models.material_vae.standard_vae import StandardVAE
-from vomp.models.material_vae.beta_tc import TripletVAE
-from vomp.trainers.vae.slat_materials import SLatVaeMaterialsTrainer
+from vomp.training.checkpoints import find_normalization_params
 from vomp.utils.dist_utils import setup_dist
+from safetensors.torch import load_file
+from vomp.models.geometry_encoder import ElasticGeometryEncoder, ElasticSLatVoxelDecoder
+from vomp.models import material_vae
+from vomp.trainers.vae.slat_materials import SLatVaeMaterialsTrainer
+from vomp.datasets import SparseVoxelMaterials
+from easydict import EasyDict as edict
 
 
 def find_ckpt(cfg):
@@ -78,6 +78,40 @@ def get_model_summary(model):
     return model_summary
 
 
+def dataset_arguments(config, normalization_params_file):
+    """Apply configured archive handling and disable evaluation augmentation."""
+    common = dict(config["dataset"]["args"])
+    common["normalization_params_file"] = normalization_params_file
+    if "normalization_type" in config["dataset"]:
+        common["normalization_type"] = config["dataset"]["normalization_type"]
+    common.setdefault("archive_format", "benchmark")
+    train_args = dict(common)
+    train_args.setdefault("split", "train")
+    val_args = dict(common, split="val", random_grid_rotation=False, feature_noise_std=0.0)
+    return train_args, val_args
+
+
+def validate_model_config(config):
+    """Validate dimensions along the configured encoder/decoder path."""
+    models = config["models"]
+    encoder = models["geometry_encoder"]["args"]
+    if config["dataset"]["args"]["resolution"] != encoder["resolution"]:
+        raise ValueError("dataset and geometry encoder resolutions must match")
+    mode = config.get("training_mode", "encoder_only")
+    if mode == "encoder_only":
+        if encoder["latent_channels"] != models["matvae"]["args"]["z_dim"]:
+            raise ValueError("geometry encoder latent channels must match MatVAE z_dim")
+    elif mode in {"encoder_decoder_matvae", "encoder_decoder_direct"}:
+        decoder = models["decoder"]["args"]
+        if decoder["latent_channels"] != encoder["latent_channels"]:
+            raise ValueError("geometry encoder and decoder latent channels must match")
+        output_channels = 3 if mode == "encoder_decoder_direct" else models["matvae"]["args"]["z_dim"]
+        if decoder["out_channels"] != output_channels:
+            raise ValueError("decoder output channels must match its material prediction target")
+    else:
+        raise ValueError(f"Invalid training_mode: {mode}")
+
+
 def main(local_rank, cfg):
     # Set up distributed training
     rank = cfg.node_rank * cfg.num_gpus + local_rank
@@ -88,88 +122,11 @@ def main(local_rank, cfg):
     # Seed rngs
     setup_rng(rank)
 
-    # Determine normalization parameters file path
-    normalization_params_file = None
-    if cfg.get("matvae_checkpoint") is not None:
-        # Extract the directory containing the matvae checkpoint
-        import os
+    validate_model_config(cfg)
 
-        matvae_checkpoint_path = cfg.matvae_checkpoint
-
-        # Navigate to the project directory (up from checkpoints/checkpoint_X/)
-        if "checkpoints" in matvae_checkpoint_path:
-            # For paths like: outputs/matvae/checkpoints/checkpoint_821/model.safetensors
-            # Need to go up 3 levels: model.safetensors -> checkpoint_X -> checkpoints -> project_dir
-            matvae_project_dir = os.path.dirname(
-                os.path.dirname(os.path.dirname(matvae_checkpoint_path))
-            )
-            normalization_params_file = os.path.join(
-                matvae_project_dir, "normalization_params.json"
-            )
-        else:
-            # For other checkpoint path formats, try to find the normalization params
-            checkpoint_dir = os.path.dirname(matvae_checkpoint_path)
-            normalization_params_file = os.path.join(
-                checkpoint_dir, "normalization_params.json"
-            )
-
-        if os.path.exists(normalization_params_file):
-            if rank == 0:
-                print(
-                    f"Found normalization parameters file: {normalization_params_file}"
-                )
-        else:
-            if rank == 0:
-                print(
-                    f"ERROR: Could not find normalization parameters file at {normalization_params_file}"
-                )
-                print(
-                    "This file is required for consistent normalization between matvae and geometry encoder training!"
-                )
-                print(
-                    "Make sure the matvae was trained with the updated train_material_vae.py that saves normalization_params.json"
-                )
-            raise FileNotFoundError(
-                f"Required normalization parameters file not found: {normalization_params_file}"
-            )
-    else:
-        if rank == 0:
-            print("ERROR: No matvae_checkpoint specified in config!")
-            print(
-                "The matvae_checkpoint is required to locate the normalization parameters file."
-            )
-        raise ValueError(
-            "matvae_checkpoint must be specified in config to load normalization parameters"
-        )
-
-    # Load data
-    train_dataset_args = cfg.dataset.args.copy()
-    train_dataset_args["split"] = "train"
-
-    # Add normalization type if specified in config
-    if "normalization_type" in cfg.dataset:
-        train_dataset_args["normalization_type"] = cfg.dataset.normalization_type
-        if rank == 0:
-            print(
-                f"Using material normalization type: {cfg.dataset.normalization_type}"
-            )
-
-    # Add normalization parameters file (now mandatory)
-    train_dataset_args["normalization_params_file"] = normalization_params_file
-
+    normalization_params_file = find_normalization_params(cfg)
+    train_dataset_args, val_dataset_args = dataset_arguments(cfg, normalization_params_file)
     dataset = SparseVoxelMaterials(**train_dataset_args)
-
-    # Create validation dataset
-    val_dataset_args = cfg.dataset.args.copy()
-    val_dataset_args["split"] = "val"
-
-    # Add normalization type if specified in config
-    if "normalization_type" in cfg.dataset:
-        val_dataset_args["normalization_type"] = cfg.dataset.normalization_type
-
-    # Add normalization parameters file (now mandatory)
-    val_dataset_args["normalization_params_file"] = normalization_params_file
-
     val_dataset = SparseVoxelMaterials(**val_dataset_args)
 
     # Build trainable models (only geometry encoder)
@@ -186,9 +143,7 @@ def main(local_rank, cfg):
         ).cuda()
 
     # Load frozen matvae model separately
-    from vomp.models.material_vae.beta_tc import TripletVAE
-
-    matvae = TripletVAE(**cfg.models.matvae.args).cuda()
+    matvae = material_vae.from_config(cfg.models.matvae).cuda()
 
     # Load matvae checkpoint if provided
     if cfg.get("matvae_checkpoint") is not None:
@@ -246,12 +201,12 @@ def main(local_rank, cfg):
             trainer.run()
 
 
-if __name__ == "__main__":
+def cli(argv=None):
     # Arguments and config
     parser = argparse.ArgumentParser()
     ## config
     parser.add_argument(
-        "--config", type=str, required=True, help="Experiment config file"
+        "--config", type=str, required=True, help="Experiment configuration"
     )
     ## io and resume
     parser.add_argument(
@@ -267,7 +222,7 @@ if __name__ == "__main__":
         help="Checkpoint step to resume training, default to latest",
     )
     parser.add_argument(
-        "--data_dir", type=str, default="./data/", help="Data directory"
+        "--data_dir", type=str, default=None, help="Override dataset roots (comma-separated)"
     )
     parser.add_argument(
         "--auto_retry", type=int, default=3, help="Number of retries on error"
@@ -295,11 +250,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--master_port", type=str, default="12345", help="Port for distributed training"
     )
-    opt = parser.parse_args()
+    opt = parser.parse_args(argv)
     opt.load_dir = opt.load_dir if opt.load_dir != "" else opt.output_dir
     opt.num_gpus = torch.cuda.device_count() if opt.num_gpus == -1 else opt.num_gpus
     ## Load config
-    config = json.load(open(opt.config, "r"))
+    path = Path(opt.config)
+    config = json.loads(path.read_text())
+    if opt.data_dir is not None:
+        config["dataset"]["args"]["roots"] = opt.data_dir
     ## Combine arguments and config
     cfg = edict()
     cfg.update(opt.__dict__)
@@ -335,4 +293,10 @@ if __name__ == "__main__":
                 break
             except Exception as e:
                 print(f"Error: {e}")
+                if rty + 1 == cfg.auto_retry:
+                    raise
                 print(f"Retrying ({rty + 1}/{cfg.auto_retry})...")
+
+
+if __name__ == "__main__":
+    cli()

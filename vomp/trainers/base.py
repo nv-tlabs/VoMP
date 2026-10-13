@@ -30,6 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .utils import *
 from ..utils.general_utils import *
 from ..utils.data_utils import recursive_to_device, cycle, ResumableSampler
+import traceback
 
 
 class Trainer:
@@ -57,8 +58,9 @@ class Trainer:
         fp16_mode="inflat_all",
         fp16_scale_growth=1e-3,
         finetune_ckpt=None,
+        parameter_lr_multipliers=None,
         log_param_stats=False,
-        prefetch_data=True,
+        prefetch_data=False,
         i_print=1000,
         i_log=500,
         i_sample=10000,
@@ -82,6 +84,7 @@ class Trainer:
         self.ema_rate = [ema_rate] if isinstance(ema_rate, float) else ema_rate
         self.fp16_mode = fp16_mode
         self.fp16_scale_growth = fp16_scale_growth
+        self.parameter_lr_multipliers = dict(parameter_lr_multipliers or {})
         self.log_param_stats = log_param_stats
         self.prefetch_data = prefetch_data
         if self.prefetch_data:
@@ -172,9 +175,9 @@ class Trainer:
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=self.batch_size_per_gpu,
-            num_workers=16,
+            num_workers=max(1, 16 // self.world_size),
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
             persistent_workers=True,
             prefetch_factor=4,
             collate_fn=(
@@ -374,48 +377,45 @@ class Trainer:
                         self.writer.add_scalar(key, value, self.step)
                     log = []
 
-                # Run validation
-                if (
-                    hasattr(self, "validate")
-                    and hasattr(self, "i_eval")
-                    and self.step % self.i_eval == 0
-                ):
-                    if self.is_master:
-                        print(f"Running validation at step {self.step}...")
-
-                        # Set all models to eval mode (only on master process)
-                        for model in self.models.values():
-                            model.eval()
-
-                        # Run validation with error handling (only on master process)
-                        val_metrics = {}
-                        try:
-                            val_metrics = self.validate()
-                            if val_metrics:
-                                print(f"Validation results at step {self.step}:")
-                                for key, value in val_metrics.items():
-                                    print(f"  {key}: {value:.6f}")
-                                    # Log validation metrics to tensorboard
-                                    log_key = (
-                                        f"val_loss/{key}"
-                                        if not key.startswith("val_")
-                                        else f"val_loss/{key[4:]}"
-                                    )
-                                    self.writer.add_scalar(log_key, value, self.step)
-
-                        except Exception as e:
-                            print(f"Error during validation: {e}")
-                            import traceback
-
-                            traceback.print_exc()
-
-                        # Set all models back to train mode (only on master process)
-                        for model in self.models.values():
-                            model.train()
-
                 # Save checkpoint
                 if self.step % self.i_save == 0:
                     self.save()
+
+            if (
+                hasattr(self, "validate")
+                and hasattr(self, "i_eval")
+                and self.step % self.i_eval == 0
+            ):
+                if self.world_size > 1:
+                    dist.barrier()
+                if self.is_master:
+                    print(f"Running validation at step {self.step}...")
+
+                    for model in self.models.values():
+                        model.eval()
+
+                    val_metrics = {}
+                    try:
+                        val_metrics = self.validate()
+                        if val_metrics:
+                            print(f"Validation results at step {self.step}:")
+                            for key, value in val_metrics.items():
+                                print(f"  {key}: {value:.6f}")
+                                log_key = (
+                                    f"val_loss/{key}"
+                                    if not key.startswith("val_")
+                                    else f"val_loss/{key[4:]}"
+                                )
+                                self.writer.add_scalar(log_key, value, self.step)
+                    except Exception as e:
+                        print(f"Error during validation: {e}")
+
+                        traceback.print_exc()
+
+                    for model in self.models.values():
+                        model.train()
+                if self.world_size > 1:
+                    dist.barrier()
 
         # Close progress bar
         if pbar is not None:

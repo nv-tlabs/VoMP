@@ -3,6 +3,7 @@
 
 <a href="https://arxiv.org/abs/2510.22975"><img src='https://img.shields.io/badge/arXiv-VoMP-red' alt='Paper PDF'></a>
 <a href='https://research.nvidia.com/labs/sil/projects/vomp/'><img src='https://img.shields.io/badge/Project_Page-VoMP-green' alt='Project Page'></a>
+<a href='https://huggingface.co/spaces/nvidia/PhysicalAI-Robotics-VoMP-Demo'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20-Demo-yellow' alt='Demo'></a>
 <a href='https://huggingface.co/nvidia/PhysicalAI-Simulation-VoMP-Model'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20-Models-yellow'></a>
 <a href='https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-PhysicalAssets-VoMP'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20-GVM%20Dataset-yellow'></a>
 </div>
@@ -10,6 +11,9 @@
 ![](./images/teaser.png)
 
 This repository provides the implementation of **VoMP**. TL;DR: Feed-forward, fine-grained, physically based volumetric material properties from Splats, Meshes, NeRFs, etc. which can be used to produce realistic worlds. We recommend reading the [README_train.md](./README_train.md) if you need to fine-tune or train the model from scratch or know more details about the codebase.
+
+> [!NOTE]
+> This repository now contains VoMP 1.0 and VoMP 1.1. VoMP 1.1 is a more robust model. The instructions in README work for either version, simply change the config file you use.
 
 ---
 
@@ -57,7 +61,7 @@ All the instructions in this README are meant to be run from the root of the rep
 
 ### Setup a Virtual Environment (Recommended)
 
-First set up the environment. We recommend using Python>=3.10, PyTorch>=2.1.0, and CUDA>=11.8. It is okay if some packages show warnings or fail to install due to version conflicts. The version conflicts are not a problem for the functionalities we use.
+First set up the environment. We recommend using Python 3.11, PyTorch>=2.1.0, and CUDA>=11.8. It is okay if some packages show warnings or fail to install due to version conflicts. The version conflicts are not a problem for the functionalities we use.
 
 ```bash
 git clone --recursive https://github.com/nv-tlabs/VoMP
@@ -73,62 +77,34 @@ chmod +x install_env.sh
 
 ### Install a Mesh Renderer (Required for Mesh Processing Only)
 
-We only need a mesh renderer so you can download any one of Isaac Sim or Blender. There is no need to install both.
+#### Blender
+
+The mesh and USD pipeline uses `bpy==4.2.0`. It renders the geometry and saves the mesh used for voxelization in the same coordinate frame. The high-level APIs use this installed module by default:
+
+```python
+results = model.get_mesh_materials("mesh.obj")
+results = model.get_usd_materials("model.usd")
+```
+
+A Blender 4.2 executable can also be passed through `blender_path`.
 
 #### Isaac Sim
 
-For mesh material estimation, you need to install Isaac Sim or Blender manually. *This is not required for Gaussian splat processing.*
+For rendering with Isaac Sim, you need to install it manually. *This is not required for Gaussian splat processing.*
 
 Download Isaac Sim from [here](https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/index.html) and follow the instructions to install it. On Linux, you would have a `isaac-sim.sh` file in the path you installed it. For Windows, you would have a `isaac-sim.bat` file in the path you installed it. Note the path to the `isaac-sim.sh` or `isaac-sim.bat` file.
 
 > [!NOTE]
-> You'll need to provide the Isaac Sim binary path when using mesh APIs.
+> Provide the Isaac Sim binary path through `isaac_sim_path` when calling `model.render_views_replicator()`, or set the `ISAAC_SIM_PATH` environment variable.
 
 > [!WARNING]
-> We use Replicator in Isaac Sim to render meshes. Replicator supports USD assets. If you want to use a USD asset, since USD files can contain many things in many formats we expect you to have used [existing tools](https://openusd.org/release/toolset.html) to convert it into an explicit mesh. If you want to use a mesh asset, you can use Replicator by also having a USD file of your mesh that you can make by using [existing tools](https://openusd.org/release/toolset.html).  
-
-#### Blender
-
-For mesh material estimation, you need to install Blender 3.0+ manually. *This is not required for Gaussian splat processing.*
-
-```bash
-# Install system dependencies
-sudo apt-get update
-sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6
-
-# Download and install Blender 3.0.1
-wget https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz
-tar -xvf blender-3.0.1-linux-x64.tar.xz
-
-# Note the path: ./blender-3.0.1-linux-x64/blender
-```
-
-> [!NOTE]
-> You'll need to provide the Blender binary path when using mesh APIs:
-> ```python
-> results = model.get_mesh_materials("mesh.obj", blender_path="/path/to/blender")
-> ```
-
-### Setup a Conda Environment (Alternative)
-
-We also provide a conda environment file to install the dependencies. This automatically creates a new environment:
-
-```bash
-# Create and install environment from file (creates 'vomp' environment)
-conda env create -f environment.yml
-
-# Activate the environment
-conda activate vomp
-```
-
-> [!WARNING]
-> We do not recommend using this installation method. The conda environment file is accurate but it reflects the environment at its final stage and does not have the step-by-step process we use to install the dependencies.
+> Replicator renders USD assets. For meshes in other formats, first convert them to USD using [existing tools](https://openusd.org/release/toolset.html).
 
 ### Trained Models
 
-We provide the trained models (1.73 GB) in <a href='https://huggingface.co/nvidia/PhysicalAI-Simulation-VoMP-Model'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20-Models-yellow'></a>. Download the models and place them in the `weights/` directory. The checkpoints we will use are the `weights/matvae.safetensors` and `weights/geometry_transformer.pt` files.
+We provide the trained models (3.44 GB for both versions, including fine-tuning checkpoints) in <a href='https://huggingface.co/nvidia/PhysicalAI-Simulation-VoMP-Model'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20-Models-yellow'></a>. Download the models into `weights/`, keeping the `vomp_1_0/` and `vomp_1_1/` folders. The examples below use VoMP 1.1: `weights/vomp_1_1/matvae.safetensors` and `weights/vomp_1_1/geometry_transformer.pt`.
 
-The above two files from the model repository contains the final checkpoint of the model. If you need to fine-tune the model, you can follow the same process but download the `ft` directory from the HuggingFace repo too and place them in the `weights/` directory.
+For VoMP 1.0, use the matching files and inference config under `weights/vomp_1_0/`. Each version folder contains the files below. If you need to fine-tune the model, also download that version's `ft/` directory, for example `weights/vomp_1_1/ft/`.
 
 | **File** | **Model** |
 |------|----------------|
@@ -140,9 +116,10 @@ The above two files from the model repository contains the final checkpoint of t
 
 ## 🌐 Quickstart: Web Demo
 
-We provide a simple web demo to quickly test out VoMP in a GUI. The web-demo uses some additional dependecies over the base environment, see [`gradio/requirements.txt`](./gradio/requirements.txt). To start the web demo, run:
+We provide a simple web demo to quickly test out VoMP in a GUI. The web-demo uses some additional dependecies over the base environment, see [`gradio/requirements.txt`](./gradio/requirements.txt). To start it, run:
 
 ```bash
+pip install --no-build-isolation -r gradio/requirements.txt
 python gradio/app.py
 ```
 
@@ -159,9 +136,9 @@ The simplest way to load the model is using the inference configuration file:
 ```python
 from vomp.inference import Vomp
 
-# Load model using inference config (recommended - uses final_ckpt.zip weights)
+# Load model using inference config (recommended)
 model = Vomp.from_checkpoint(
-    config_path="weights/inference.json",
+    config_path="weights/vomp_1_1/inference.json",
     use_trt=False # Set to True to enable TensorRT acceleration (significantly faster but requires `torch-tensorrt`)
 )
 ```
@@ -176,32 +153,32 @@ For more control, you can specify exact checkpoint files, optionally overriding 
 ```python
 # Load model using direct file paths
 model = Vomp.from_checkpoint(
-    config_path="weights/inference.json",
-    geometry_checkpoint_dir="weights/geometry_transformer.pt",
-    matvae_checkpoint_dir="weights/matvae.safetensors",
-    normalization_params_path="weights/normalization_params.json"
+    config_path="weights/vomp_1_1/inference.json",
+    geometry_checkpoint_dir="weights/vomp_1_1/geometry_transformer.pt",
+    matvae_checkpoint_dir="weights/vomp_1_1/matvae.safetensors",
+    normalization_params_path="weights/vomp_1_1/normalization_params.json"
 )
 
 # Or override specific paths from inference config
 model = Vomp.from_checkpoint(
-    config_path="configs/materials/inference.json",
+    config_path="configs/materials/v1.1/inference.json",
     geometry_checkpoint_dir="custom/path/to/geometry_transformer.pt"  # Override just this path
 )
 ```
 
 ### Using Directories (use for fine-tuning)
 
-Use this approach only if you are using the fine-tuning checkpoints i.e. the `ft/` directory in the model repository. This lets the model auto-find the latest checkpoints:
+Use this approach only if you are using the fine-tuning checkpoints i.e. the `ft/` directory for your model version. This lets the model auto-find the latest geometry checkpoint:
 
 ```python
 from vomp.inference import Vomp
 
-# Load model using directories (auto-finds latest checkpoints)
+# Load model using checkpoint directories
 model = Vomp.from_checkpoint(
-    config_path="weights/inference.json",
-    geometry_checkpoint_dir="weights/ft/geometry_transformer",
-    matvae_checkpoint_dir="weights/ft/matvae", 
-    normalization_params_path="weights/ft/matvae/normalization_params.json",
+    config_path="weights/vomp_1_1/inference.json",
+    geometry_checkpoint_dir="weights/vomp_1_1/ft/geometry_transformer",
+    matvae_checkpoint_dir="weights/vomp_1_1/ft/matvae/final_model",
+    normalization_params_path="weights/vomp_1_1/ft/matvae/normalization_params.json",
     geometry_ckpt="latest"  # Can also be a specific step number
 )
 ```
@@ -245,19 +222,15 @@ from vomp.inference.utils import save_materials
 
 # Get materials directly from mesh file (supports OBJ, PLY, STL, USD)
 # By default, returns materials evaluated at each mesh vertex (not recommended if you have vertices only on the surface)
-# Note: Requires Blender installation (see Dependencies section)
-results = model.get_mesh_materials(
-    "path/to/your/mesh.obj",
-    blender_path="/tmp/blender-3.0.1-linux-x64/blender"  # Adjust path as needed
-)
+results = model.get_mesh_materials("path/to/your/mesh.obj")
 
 # Control where materials are evaluated using query_points:
 # results = model.get_mesh_materials("path/to/your/mesh.obj", query_points="mesh_vertices")  # Default
 # results = model.get_mesh_materials("path/to/your/mesh.obj", query_points="voxel_centers")  # Voxel centers (direct output of the model)
 # results = model.get_mesh_materials("path/to/your/mesh.obj", query_points=custom_points)    # Custom (N,3) array
 
-# Use parallel rendering and adjust DINO batch size for better performance
-# results = model.get_mesh_materials("path/to/your/mesh.obj", num_render_jobs=4, dino_batch_size=32, blender_path="/path/to/blender")
+# Adjust DINO batch size for available GPU memory.
+# results = model.get_mesh_materials("path/to/your/mesh.obj", dino_batch_size=32)
 
 # Save results
 save_materials(results, "materials.npz")
@@ -269,24 +242,21 @@ USD files can come in many different formats with varying internal structures, m
 
 #### General USD Formats
 
-For USD files in any format, use [Isaac Sim Replicator](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/replicator_tutorials/index.html) rendering with a separate mesh file for voxelization:
+The USD API renders the asset's composed geometry and textures and uses that same geometry for voxelization:
 
 ```python
 from vomp.inference.utils import save_materials
 
-# For general USD files - requires Isaac Sim and separate mesh
-# Note: Requires Isaac Sim installation and a separate mesh file for voxelization
-# Isaac Sim renders the USD while the mesh is used for voxelization
+# Render the USD with Blender and use the same geometry for voxelization
 results = model.get_usd_materials(
     usd_path="path/to/your/model.usd",
-    mesh_path="path/to/your/model.ply",  # Mesh for voxelization (doesn't need to be normalized)
-    isaac_sim_path="~/isaac-sim/isaac-sim.sh",  # Or set ISAAC_SIM_PATH environment variable
-    render_mode="path_tracing"  # Options: "fast" or "path_tracing"
+    query_points="voxel_centers",  # Default (direct output)
+    return_original_scale=True,   # Return positions in the original asset's coordinates
 )
 
 # Control where materials are evaluated using query_points:
 # results = model.get_usd_materials(..., query_points="voxel_centers")  # Default (direct output)
-# results = model.get_usd_materials(..., query_points=custom_points)    # Custom (N,3) array
+# results = model.get_usd_materials(..., query_points=custom_points)    # Custom (N,3) array in normalized coordinates
 
 # Adjust DINO batch size for performance (higher values use more GPU memory):
 # results = model.get_usd_materials(..., dino_batch_size=32)
@@ -294,59 +264,6 @@ results = model.get_usd_materials(
 # Save results
 save_materials(results, "materials.npz")
 ```
-
-Isaac Sim Replicator provides flexible rendering modes:
-
-```python
-# Option 1: Fast Mode - Real-time ray tracing
-results = model.get_usd_materials(
-    usd_path="model.usd",
-    mesh_path="model.ply",
-    isaac_sim_path="~/isaac-sim/isaac-sim.sh",
-    render_mode="fast"  # Real-time ray tracing
-)
-
-# Option 2: Path Tracing - Higher quality
-results = model.get_usd_materials(
-    usd_path="model.usd",
-    mesh_path="model.ply",
-    isaac_sim_path="~/isaac-sim/isaac-sim.sh",
-    render_mode="path_tracing"  # 256 spp, 8 bounces, denoising enabled
-)
-
-# Option 3: start from a setting and override some RTX settings
-from vomp.inference import RTX_PRESETS
-print(RTX_PRESETS.keys())  # See available presets: ['fast', 'path_tracing']
-
-results = model.get_usd_materials(
-    usd_path="model.usd",
-    mesh_path="model.ply",
-    isaac_sim_path="~/isaac-sim/isaac-sim.sh",
-    render_mode="path_tracing",
-    rtx_settings_override={
-        # Enable path tracing renderer
-        "/rtx/rendermode": "PathTracing",
-        
-        # Path tracing quality settings
-        "/rtx/pathtracing/spp": 256,  # Samples per pixel (higher = better quality, slower)
-        "/rtx/pathtracing/totalSpp": 256,  # Total samples per pixel
-        "/rtx/pathtracing/maxBounces": 8,  # Maximum light bounces
-        "/rtx/pathtracing/maxSpecularAndTransmissionBounces": 8,
-        
-        # Additional quality settings
-        "/rtx/pathtracing/fireflyFilter/enable": True,  # Reduce fireflies (bright pixels)
-        "/rtx/pathtracing/optixDenoiser/enabled": True,  # Enable denoiser for clean renders
-
-        # ... other RTX settings you want to override
-    }
-)
-```
-
-> [!WARNING]
-> Please do not override the following RTX settings, as they are required for the model to work correctly:
-> - "/rtx/post/backgroundZeroAlpha/enabled": True,
-> - "/rtx/post/backgroundZeroAlpha/backgroundComposite": False,
-> - "/rtx/post/backgroundZeroAlpha/outputAlphaInComposite": True,
 
 #### SimReady Format USD
 
@@ -358,7 +275,6 @@ from vomp.inference.utils import save_materials
 results = model.get_usd_materials(
     usd_path="model.usd",
     use_simready_usd_format=True,
-    blender_path="/path/to/blender",
     seed=42
 )
 
@@ -403,7 +319,8 @@ from vomp.inference.utils import save_materials
 
 # Load Gaussian splat
 gaussian = Gaussian(sh_degree=3, aabb=[-1,-1,-1,2,2,2], device="cuda")
-gaussian.load_ply("path/to/your/gaussian_splat.ply")
+gaussian.load_ply("path/to/your/gaussian_splat.ply", transform=None)
+gaussian = model._normalize_gaussian(gaussian)
 
 # Step-by-step pipeline
 output_dir = "outputs/materials"
@@ -424,8 +341,7 @@ from vomp.inference.utils import save_materials
 # Step-by-step pipeline for meshes
 output_dir = "outputs/materials"
 mesh_path = "path/to/your/mesh.obj"
-blender_path = "/tmp/blender-3.0.1-linux-x64/blender"  # Adjust for your installation
-renders_metadata = model.render_mesh_views(mesh_path, output_dir, num_views=150, blender_path=blender_path)
+renders_metadata = model.render_mesh_views(mesh_path, output_dir, num_views=150)
 voxel_centers = model._voxelize_mesh(mesh_path, output_dir)
 coords, features = model._extract_dino_features(output_dir, voxel_centers, renders_metadata, save_features=True)
 results = model.predict_materials(coords, features)
@@ -434,32 +350,18 @@ save_materials(results, "materials.npz")
 
 ### USD Assets
 
-For fine-grained control with USD assets using Replicator rendering (see [Loading the Model](#-loading-the-model) section first):
+Use the same rendering and voxelization stages as meshes. USD assets come in many formats so`dataset="common"` selects the general USD material loader; use `"simready"` for SimReady assets.
 
 ```python
 from vomp.inference.utils import save_materials
 
-# Step-by-step pipeline for USD assets with Replicator
 output_dir = "outputs/materials"
 usd_path = "path/to/your/model.usd"
-mesh_path = "path/to/your/model.ply"  # For voxelization
-isaac_sim_path = "~/isaac-sim/isaac-sim.sh"
-
-# Render using Replicator (with custom settings)
-renders_metadata = model.render_views_replicator(
-    asset_path=usd_path,
-    output_dir=output_dir,
-    num_views=150,
-    isaac_sim_path=isaac_sim_path,
-    render_mode="path_tracing",  # or "fast"
-    rtx_settings_override={
-        "/rtx/pathtracing/spp": 512  # Optional: custom settings
-    }
+renders_metadata = model.render_mesh_views(usd_path, output_dir, dataset="common")
+voxel_centers = model._voxelize_mesh(usd_path, output_dir)
+coords, features = model._extract_dino_features(
+    output_dir, voxel_centers, renders_metadata, save_features=True
 )
-
-# Voxelize and extract features
-voxel_centers = model._voxelize_mesh(mesh_path, output_dir)
-coords, features = model._extract_dino_features(output_dir, voxel_centers, renders_metadata, save_features=True)
 results = model.predict_materials(coords, features)
 save_materials(results, "materials.npz")
 ```
@@ -481,10 +383,18 @@ def my_render_func(obj, output_dir, num_views, image_size, **kwargs):
             "transform_matrix": camera_matrix.tolist(),  # 4x4 matrix
             "camera_angle_x": fov_radians
         })
+
+    # Save RGBA images and their camera manifest for feature-cache validation.
+    import json
+    from pathlib import Path
+    render_dir = Path(output_dir) / "renders"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    (render_dir / "transforms.json").write_text(json.dumps({"frames": frames_metadata}))
     return frames_metadata
 
 def my_voxelize_func(obj, output_dir, **kwargs):
     # Your voxelization code here
+    # Return unique 64^3 cell centers: (integer_indices + 0.5) / 64 - 0.5.
     voxel_centers = your_voxelization_method(obj)  # (N, 3) array
     return voxel_centers
 
@@ -511,10 +421,12 @@ from vomp.inference.utils import MaterialUpsampler
 from vomp.representations.gaussian import Gaussian
 
 # Get voxel-level materials (needed for upsampling to custom locations)
-# Note: Use query_points="voxel_centers" to get voxel-level results
-voxel_results = model.get_splat_materials("path/to/your/gaussian_splat.ply", query_points="voxel_centers")
+voxel_results = model.get_splat_materials(
+    "path/to/your/gaussian_splat.ply",
+    query_points="voxel_centers", return_original_scale=False,
+)
 # OR for meshes 
-# voxel_results = model.get_mesh_materials("path/to/your/mesh.obj", query_points="voxel_centers", blender_path="/path/to/blender")
+# voxel_results = model.get_mesh_materials("path/to/your/mesh.obj", query_points="voxel_centers", return_original_scale=False)
 
 # Create upsampler from voxel-level results
 upsampler = MaterialUpsampler(
@@ -528,7 +440,8 @@ upsampler = MaterialUpsampler(
 
 # Example 1: Interpolate to Gaussian centers manually (usually not needed - high-level API does this)
 gaussian = Gaussian(sh_degree=3, aabb=[-1,-1,-1,2,2,2], device="cuda")
-gaussian.load_ply("path/to/your/gaussian_splat.ply")
+gaussian.load_ply("path/to/your/gaussian_splat.ply", transform=None)
+gaussian = model._normalize_gaussian(gaussian)
 gaussian_materials, gaussian_distances = upsampler.interpolate_to_gaussians(gaussian)
 
 # Example 2: Interpolate to higher resolution grid (128x128x128) - main use case for manual upsampling
@@ -560,18 +473,17 @@ We provide a dataset and a benchmark with fine-grained volumetric mechanical pro
 Since our dataset is quite large, we provide a way to download only the test set by running the following command:
 
 ```bash
-huggingface-cli download nvidia/PhysicalAI-Robotics-PhysicalAssets-VoMP-Eval --repo-type dataset --local-dir datasets/simready
+huggingface-cli download nvidia/PhysicalAI-Robotics-PhysicalAssets-VoMP-Eval --repo-type dataset --local-dir datasets/simready_benchmark
 ```
 
 We can now run VoMP on the test set:
 
 ```bash
 python scripts/evaluate_geometry_encoder.py \
-    --config weights/inference.json \ # replace with your own config file
-    --checkpoint_dir weights/ft/geometry_transformer \ # replace with your own checkpoint directory
-    --data_dir datasets/simready \ # replace with your own data directory
-    # --ckpt latest \
-    # --results
+    --config configs/materials/v1/inference.json \
+    --checkpoint_dir weights/vomp_1_0/ft/geometry_transformer \
+    --data_dir datasets/simready_benchmark \
+    --ckpt latest
 ```
 
 This script requires loading the model in the ["Using Directories" method](#using-directories).

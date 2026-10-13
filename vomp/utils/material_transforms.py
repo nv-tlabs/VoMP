@@ -15,8 +15,13 @@
 
 """Material property transforms for normalization and denormalization."""
 
-import torch
+import json
+import math
 from typing import Dict, Tuple, Optional
+
+import torch
+
+from .material_vae_normalization import forward_components, inverse_components
 
 
 class MaterialPropertyTransform:
@@ -55,6 +60,45 @@ class MaterialPropertyTransform:
         self.rho_min = None
         self.rho_max = None
 
+    @classmethod
+    def from_params(
+        cls, params: Dict, normalization_type: str = "log_minmax"
+    ) -> "MaterialPropertyTransform":
+        """Load raw physical bounds saved by MatVAE, not transformed state_dict bounds."""
+        if params.get("normalization_type", normalization_type) != normalization_type:
+            raise ValueError("checkpoint normalization type does not match the config")
+        transform = cls(normalization_type=normalization_type)
+        if normalization_type == "standard":
+            transform.mu = torch.tensor(params["mu"])
+            transform.std = torch.tensor(params["std"])
+            transform.nu_min = params.get("nu_min", 0.0)
+            transform.nu_max = params.get("nu_max", 0.5)
+        elif normalization_type in {"log_minmax", "log_minmax_no_density"}:
+            # Keep Python log10 here: existing geometry training/inference loaders
+            # use these scalar bounds, unlike MatVAE's float32 tensor-bound path.
+            transform.E_min = math.log10(params["E_min"])
+            transform.E_max = math.log10(params["E_max"])
+            transform.nu_min = params["nu_min"]
+            transform.nu_max = params["nu_max"]
+            if normalization_type == "log_minmax":
+                transform.rho_min = math.log10(params["rho_min"])
+                transform.rho_max = math.log10(params["rho_max"])
+            else:
+                transform.rho_min = params["rho_min"]
+                transform.rho_max = params["rho_max"]
+        else:
+            raise ValueError(f"Unknown normalization_type: {normalization_type}")
+        transform._stats_computed = True
+        return transform
+
+    @classmethod
+    def from_json(
+        cls, params_file, normalization_type: str = "log_minmax"
+    ) -> "MaterialPropertyTransform":
+        """Load the shared transform from a MatVAE normalization_params.json file."""
+        with open(params_file, "r", encoding="utf-8") as stream:
+            return cls.from_params(json.load(stream), normalization_type)
+
     def forward_transform(
         self, properties: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -66,93 +110,18 @@ class MaterialPropertyTransform:
         Returns:
             Transformed properties dictionary
         """
-        if self.normalization_type == "log_minmax":
-            return self._log_minmax_transform(properties)
-        elif self.normalization_type == "log_minmax_no_density":
-            return self._log_minmax_no_density_transform(properties)
+        mode = self.normalization_type
+        if mode in {"log_minmax", "log_minmax_no_density"}:
+            if not self._stats_computed:
+                raise ValueError("Must compute stats before log minmax transform")
         else:
-            return self._standard_transform(properties)
-
-    def _standard_transform(
-        self, properties: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply standard log/logit transform."""
-        transformed = {}
-
-        # Young's modulus - log transform
-        E = properties["youngs_modulus"]
-        E_clamped = torch.clamp_min(E, 1e-8)
-        transformed["youngs_modulus"] = torch.log10(E_clamped)
-
-        # Poisson's ratio - logit transform with bounds
-        nu = properties["poissons_ratio"]
-        # Normalize to [0, 1] range based on physical bounds
-        p = (nu - self.nu_min) / (self.nu_max - self.nu_min)
-        p_clamped = torch.clamp(p, 1e-4, 1.0 - 1e-4)
-        transformed["poissons_ratio"] = torch.logit(p_clamped)
-
-        # Density - log transform
-        rho = properties["density"]
-        rho_clamped = torch.clamp_min(rho, 1e-8)
-        transformed["density"] = torch.log10(rho_clamped)
-
-        return transformed
-
-    def _log_minmax_transform(
-        self, properties: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply log minmax transform."""
-        if not self._stats_computed:
-            raise ValueError("Must compute stats before log minmax transform")
-
-        transformed = {}
-
-        # Young's modulus - log transform then min-max normalize
-        E = properties["youngs_modulus"]
-        E_clamped = torch.clamp_min(E, 1e-8)
-        log_E = torch.log10(E_clamped)
-        transformed["youngs_modulus"] = (log_E - self.E_min) / (self.E_max - self.E_min)
-
-        # Poisson's ratio - min-max normalize directly
-        nu = properties["poissons_ratio"]
-        transformed["poissons_ratio"] = (nu - self.nu_min) / (self.nu_max - self.nu_min)
-
-        # Density - log transform then min-max normalize
-        rho = properties["density"]
-        rho_clamped = torch.clamp_min(rho, 1e-8)
-        log_rho = torch.log10(rho_clamped)
-        transformed["density"] = (log_rho - self.rho_min) / (
-            self.rho_max - self.rho_min
+            mode = "standard"
+        names = ("youngs_modulus", "poissons_ratio", "density")
+        values = forward_components(
+            *(properties[name] for name in names), self.nu_min, self.nu_max, mode,
+            self.E_min, self.E_max, self.rho_min, self.rho_max,
         )
-
-        return transformed
-
-    def _log_minmax_no_density_transform(
-        self, properties: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply log minmax transform without log for density."""
-        if not self._stats_computed:
-            raise ValueError(
-                "Must compute stats before log minmax no density transform"
-            )
-
-        transformed = {}
-
-        # Young's modulus - log transform then min-max normalize
-        E = properties["youngs_modulus"]
-        E_clamped = torch.clamp_min(E, 1e-8)
-        log_E = torch.log10(E_clamped)
-        transformed["youngs_modulus"] = (log_E - self.E_min) / (self.E_max - self.E_min)
-
-        # Poisson's ratio - min-max normalize directly
-        nu = properties["poissons_ratio"]
-        transformed["poissons_ratio"] = (nu - self.nu_min) / (self.nu_max - self.nu_min)
-
-        # Density - min-max normalize WITHOUT log transform
-        rho = properties["density"]
-        transformed["density"] = (rho - self.rho_min) / (self.rho_max - self.rho_min)
-
-        return transformed
+        return dict(zip(names, values))
 
     def forward_transform_and_standardize(
         self, properties: Dict[str, torch.Tensor]
@@ -168,10 +137,7 @@ class MaterialPropertyTransform:
         if not self._stats_computed:
             raise ValueError("Must compute stats before standardization")
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
+        if self.normalization_type == "log_minmax" or self.normalization_type == "log_minmax_no_density":
             # For log minmax variants, forward transform already includes normalization
             return self.forward_transform(properties)
         else:
@@ -204,79 +170,18 @@ class MaterialPropertyTransform:
         Returns:
             Properties in original scale
         """
-        if self.normalization_type == "log_minmax":
-            return self._log_minmax_inverse_transform(transformed)
-        elif self.normalization_type == "log_minmax_no_density":
-            return self._log_minmax_no_density_inverse_transform(transformed)
+        mode = self.normalization_type
+        if mode in {"log_minmax", "log_minmax_no_density"}:
+            if not self._stats_computed:
+                raise ValueError("Must compute stats before inverse transform")
         else:
-            return self._standard_inverse_transform(transformed)
-
-    def _standard_inverse_transform(
-        self, transformed: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply standard inverse transform."""
-        original = {}
-
-        # Young's modulus - exp transform
-        original["youngs_modulus"] = torch.pow(10, transformed["youngs_modulus"])
-
-        # Poisson's ratio - inverse logit and rescale
-        p = torch.sigmoid(transformed["poissons_ratio"])
-        original["poissons_ratio"] = p * (self.nu_max - self.nu_min) + self.nu_min
-
-        # Density - exp transform
-        original["density"] = torch.pow(10, transformed["density"])
-
-        return original
-
-    def _log_minmax_inverse_transform(
-        self, transformed: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply log minmax inverse transform."""
-        if not self._stats_computed:
-            raise ValueError("Must compute stats before inverse transform")
-
-        original = {}
-
-        # Young's modulus - inverse min-max then exp transform
-        log_E = transformed["youngs_modulus"] * (self.E_max - self.E_min) + self.E_min
-        original["youngs_modulus"] = torch.pow(10, log_E)
-
-        # Poisson's ratio - inverse min-max
-        original["poissons_ratio"] = (
-            transformed["poissons_ratio"] * (self.nu_max - self.nu_min) + self.nu_min
+            mode = "standard"
+        names = ("youngs_modulus", "poissons_ratio", "density")
+        values = inverse_components(
+            *(transformed[name] for name in names), self.nu_min, self.nu_max, mode,
+            self.E_min, self.E_max, self.rho_min, self.rho_max,
         )
-
-        # Density - inverse min-max then exp transform
-        log_rho = transformed["density"] * (self.rho_max - self.rho_min) + self.rho_min
-        original["density"] = torch.pow(10, log_rho)
-
-        return original
-
-    def _log_minmax_no_density_inverse_transform(
-        self, transformed: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """Apply log minmax inverse transform without log for density."""
-        if not self._stats_computed:
-            raise ValueError("Must compute stats before inverse transform")
-
-        original = {}
-
-        # Young's modulus - inverse min-max then exp transform
-        log_E = transformed["youngs_modulus"] * (self.E_max - self.E_min) + self.E_min
-        original["youngs_modulus"] = torch.pow(10, log_E)
-
-        # Poisson's ratio - inverse min-max
-        original["poissons_ratio"] = (
-            transformed["poissons_ratio"] * (self.nu_max - self.nu_min) + self.nu_min
-        )
-
-        # Density - inverse min-max WITHOUT exp transform
-        original["density"] = (
-            transformed["density"] * (self.rho_max - self.rho_min) + self.rho_min
-        )
-
-        return original
+        return dict(zip(names, values))
 
     def compute_stats(self, dataset_loader) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute statistics for normalization.
@@ -306,7 +211,7 @@ class MaterialPropertyTransform:
             if "material_properties" in batch:
                 props = batch["material_properties"]
                 # Apply forward transform
-                transformed = self._standard_transform(props)
+                transformed = self.forward_transform(props)
 
                 # Stack into tensor [E, nu, rho]
                 stacked = torch.stack(
@@ -458,10 +363,7 @@ class MaterialPropertyTransform:
         if not self._stats_computed:
             raise ValueError("Must compute stats before destandardization")
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
+        if self.normalization_type == "log_minmax" or self.normalization_type == "log_minmax_no_density":
             # For log minmax variants, no standardization step - direct inverse transform
             return self.inverse_transform(standardized)
         else:
@@ -490,10 +392,7 @@ class MaterialPropertyTransform:
             "_stats_computed": self._stats_computed,
         }
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
+        if self.normalization_type == "log_minmax" or self.normalization_type == "log_minmax_no_density":
             state.update(
                 {
                     "E_min": self.E_min,
@@ -514,10 +413,7 @@ class MaterialPropertyTransform:
         self.std = state_dict.get("std")
         self._stats_computed = state_dict["_stats_computed"]
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
+        if self.normalization_type == "log_minmax" or self.normalization_type == "log_minmax_no_density":
             self.E_min = state_dict.get("E_min")
             self.E_max = state_dict.get("E_max")
             self.rho_min = state_dict.get("rho_min")
@@ -569,10 +465,7 @@ class MaterialPropertyTransform:
         if not self._stats_computed:
             raise ValueError("Must compute stats before standardization")
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
+        if self.normalization_type == "log_minmax" or self.normalization_type == "log_minmax_no_density":
             # For log minmax variants, already normalized in forward transform
             return tensor
         else:
@@ -613,60 +506,14 @@ class MaterialPropertyTransform:
         if not self._stats_computed:
             raise ValueError("Must compute stats before destandardization")
 
-        if (
-            self.normalization_type == "log_minmax"
-            or self.normalization_type == "log_minmax_no_density"
-        ):
-            # For log minmax variants, no standardization step - direct inverse transform
-            shape = tensor.shape
-            tensor_flat = tensor.view(-1, 3)
-
-            props = {
-                "youngs_modulus": tensor_flat[:, 0],
-                "poissons_ratio": tensor_flat[:, 1],
-                "density": tensor_flat[:, 2],
-            }
-
-            original = self.inverse_transform(props)
-
-            result = torch.stack(
-                [
-                    original["youngs_modulus"],
-                    original["poissons_ratio"],
-                    original["density"],
-                ],
-                dim=-1,
-            )
-
-            return result.view(shape)
-        else:
-            # Standard approach: destandardize then inverse transform
-            # Ensure mu and std are on the same device as tensor
+        if self.normalization_type not in {"log_minmax", "log_minmax_no_density"}:
             mu = self.mu.to(tensor.device)
             std = self.std.to(tensor.device)
+            tensor = tensor * std + mu
 
-            # Destandardize
-            transformed = tensor * std + mu
-
-            # Apply inverse transform
-            shape = transformed.shape
-            transformed_flat = transformed.view(-1, 3)
-
-            props = {
-                "youngs_modulus": transformed_flat[:, 0],
-                "poissons_ratio": transformed_flat[:, 1],
-                "density": transformed_flat[:, 2],
-            }
-
-            original = self.inverse_transform(props)
-
-            result = torch.stack(
-                [
-                    original["youngs_modulus"],
-                    original["poissons_ratio"],
-                    original["density"],
-                ],
-                dim=-1,
-            )
-
-            return result.view(shape)
+        shape = tensor.shape
+        tensor_flat = tensor.view(-1, 3)
+        names = ("youngs_modulus", "poissons_ratio", "density")
+        props = dict(zip(names, tensor_flat.unbind(-1)))
+        original = self.inverse_transform(props)
+        return torch.stack([original[name] for name in names], dim=-1).view(shape)

@@ -16,6 +16,7 @@
 from typing import *
 import copy
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 import numpy as np
 from easydict import EasyDict as edict
@@ -25,6 +26,9 @@ from ..basic import BasicTrainer
 from ...modules.sparse import SparseTensor
 from ...utils.loss_utils import l1_loss, l2_loss, ssim, lpips
 from ...utils.data_utils import recursive_to_device
+import os
+from safetensors.torch import load_file
+import traceback
 
 
 class SLatVaeMaterialsTrainer(BasicTrainer):
@@ -75,6 +79,7 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         lambda_youngs_modulus: float = 1.0,
         lambda_poissons_ratio: float = 1.0,
         lambda_density: float = 1.0,
+        loss_reduction: str = "voxel",
         matvae=None,  # Add matvae as a separate parameter
         val_dataset=None,  # Add validation dataset
         i_eval: int = 1000,  # Add evaluation interval
@@ -90,28 +95,23 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         self.lambda_youngs_modulus = lambda_youngs_modulus
         self.lambda_poissons_ratio = lambda_poissons_ratio
         self.lambda_density = lambda_density
+        if loss_reduction not in {"voxel", "object_segment"}:
+            raise ValueError(f"Invalid loss reduction: {loss_reduction}")
+        self.loss_reduction = loss_reduction
         self.matvae = matvae  # Store the frozen matvae model
         self.val_dataset = val_dataset  # Store validation dataset
         self.i_eval = i_eval  # Store evaluation interval
         self.training_mode = training_mode  # Store training mode
 
         # Validate training mode
-        valid_modes = [
-            "encoder_only",
-            "encoder_decoder_matvae",
-            "encoder_decoder_direct",
-        ]
+        valid_modes = ["encoder_only", "encoder_decoder_matvae", "encoder_decoder_direct"]
         if self.training_mode not in valid_modes:
-            raise ValueError(
-                f"Invalid training_mode: {self.training_mode}. Must be one of {valid_modes}"
-            )
+            raise ValueError(f"Invalid training_mode: {self.training_mode}. Must be one of {valid_modes}")
 
         # Validate model availability based on training mode
         if self.training_mode in ["encoder_decoder_matvae", "encoder_decoder_direct"]:
             if "decoder" not in self.models:
-                raise ValueError(
-                    f"Training mode '{self.training_mode}' requires a decoder model in config"
-                )
+                raise ValueError(f"Training mode '{self.training_mode}' requires a decoder model in config")
 
         # Load TRELLIS pre-trained weights only if no checkpoint was loaded
         if self.trellis_weights_path is not None and self.step == 0:
@@ -121,8 +121,6 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         """
         Load pre-trained TRELLIS weights for the geometry encoder and decoder.
         """
-        import os
-        from safetensors.torch import load_file
 
         safetensors_path = os.path.join(
             self.trellis_weights_path, "ckpts", "slat_enc_swin8_B_64l8_fp16.safetensors"
@@ -135,13 +133,23 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         pretrained_state_dict = load_file(safetensors_path)
 
         # Load weights for geometry encoder
-        self._load_pretrained_weights_for_model(
-            "geometry_encoder", pretrained_state_dict
-        )
+        self._load_pretrained_weights_for_model("geometry_encoder", pretrained_state_dict)
 
         # Load weights for decoder if it exists
         if "decoder" in self.models:
             self._load_pretrained_weights_for_model("decoder", pretrained_state_dict)
+
+        # BasicTrainer creates the FP32 optimizer/EMA copies before this method
+        # runs. Keep those copies aligned with the newly loaded model weights.
+        state_dicts = {
+            name: model.state_dict() for name, model in self.models.items()
+        }
+        self._state_dicts_to_master_params(self.master_params, state_dicts)
+        if self.is_master:
+            for ema_params in self.ema_params:
+                self._state_dicts_to_master_params(ema_params, state_dicts)
+        if self.world_size > 1:
+            self.check_ddp()
 
     def _load_pretrained_weights_for_model(self, model_name, pretrained_state_dict):
         """
@@ -181,6 +189,17 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
                     print(f"✗ Not in {model_name}: {name} {param.shape}")
 
         # Load only the filtered weights
+        if model_name == "geometry_encoder":
+            unexpected_missing = (
+                set(model_state_dict)
+                - set(filtered_state_dict)
+                - {"out_layer.weight", "out_layer.bias"}
+            )
+            if unexpected_missing or not filtered_state_dict:
+                raise RuntimeError(
+                    "TRELLIS geometry weights do not match the configured encoder: "
+                    f"{sorted(unexpected_missing)}"
+                )
         model.load_state_dict(filtered_state_dict, strict=False)
 
         if self.is_master:
@@ -188,15 +207,14 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
             print(
                 f"Successfully loaded {loaded_count}/{total_pretrained} parameters from FRANKENSTEIN pre-trained weights for {model_name}"
             )
-            print(
-                f"Skipped {skipped_count} parameters due to name/shape mismatches for {model_name}"
-            )
+            print(f"Skipped {skipped_count} parameters due to name/shape mismatches for {model_name}")
             print(f"--- {model_name} pretrained weight loading complete ---\n")
 
     def training_losses(
         self,
         feats: SparseTensor,
         materials: SparseTensor,
+        segment_ids: SparseTensor = None,
         return_aux: bool = False,
         **kwargs,
     ) -> Tuple[Dict, Dict]:
@@ -225,14 +243,12 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
             latent_2d = z.feats  # Shape: [num_voxels, 2]
 
             # Step 3: Run latents through material VAE decoder
-            (E_mu, E_logvar), (nu_mu, nu_logvar), (rho_mu, rho_logvar) = (
-                self.matvae.decode(latent_2d)
+            (E_mu, E_logvar), (nu_mu, nu_logvar), (rho_mu, rho_logvar) = self.matvae.decode(
+                latent_2d
             )
 
             # Extract predictions (remove last dimension if it exists)
-            E_pred = (
-                E_mu.squeeze(-1) if E_mu.dim() > 1 else E_mu
-            )  # Shape: [total_voxels]
+            E_pred = E_mu.squeeze(-1) if E_mu.dim() > 1 else E_mu  # Shape: [total_voxels]
             nu_pred = (
                 nu_mu.squeeze(-1) if nu_mu.dim() > 1 else nu_mu
             )  # Shape: [total_voxels]
@@ -243,20 +259,16 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         elif self.training_mode == "encoder_decoder_matvae":
             # New mode: encoder → decoder → matvae
             # Step 2: Run latents through decoder to get 2D outputs
-            decoder_output = self.training_models["decoder"](
-                z
-            )  # Should output 2D latents
+            decoder_output = self.training_models["decoder"](z)  # Should output 2D latents
             latent_2d = decoder_output.feats  # Shape: [num_voxels, 2]
 
             # Step 3: Run decoder output through material VAE decoder
-            (E_mu, E_logvar), (nu_mu, nu_logvar), (rho_mu, rho_logvar) = (
-                self.matvae.decode(latent_2d)
+            (E_mu, E_logvar), (nu_mu, nu_logvar), (rho_mu, rho_logvar) = self.matvae.decode(
+                latent_2d
             )
 
             # Extract predictions (remove last dimension if it exists)
-            E_pred = (
-                E_mu.squeeze(-1) if E_mu.dim() > 1 else E_mu
-            )  # Shape: [total_voxels]
+            E_pred = E_mu.squeeze(-1) if E_mu.dim() > 1 else E_mu  # Shape: [total_voxels]
             nu_pred = (
                 nu_mu.squeeze(-1) if nu_mu.dim() > 1 else nu_mu
             )  # Shape: [total_voxels]
@@ -267,9 +279,7 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
         elif self.training_mode == "encoder_decoder_direct":
             # New mode: encoder → decoder → direct 3D outputs
             # Step 2: Run latents through decoder to get 3D material outputs directly
-            decoder_output = self.training_models["decoder"](
-                z
-            )  # Should output 3D materials
+            decoder_output = self.training_models["decoder"](z)  # Should output 3D materials
             material_predictions = decoder_output.feats  # Shape: [num_voxels, 3]
 
             # Extract predictions directly
@@ -277,40 +287,66 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
             nu_pred = material_predictions[:, 1]  # Shape: [total_voxels]
             rho_pred = material_predictions[:, 2]  # Shape: [total_voxels]
 
-        # Compute reconstruction loss based on loss_type (same for all modes)
+        # Compute reconstruction error based on loss_type (same for all modes)
         if self.loss_type == "l1":
-            l1_E = l1_loss(E_pred, gt_materials[:, 0])
-            l1_nu = l1_loss(nu_pred, gt_materials[:, 1])
-            l1_rho = l1_loss(rho_pred, gt_materials[:, 2])
-
-            loss = (
-                self.lambda_youngs_modulus * l1_E
-                + self.lambda_poissons_ratio * l1_nu
-                + self.lambda_density * l1_rho
+            errors = (
+                torch.abs(E_pred - gt_materials[:, 0]),
+                torch.abs(nu_pred - gt_materials[:, 1]),
+                torch.abs(rho_pred - gt_materials[:, 2]),
             )
-
-            # Individual loss components for logging
-            loss_youngs = l1_E
-            loss_poisson = l1_nu
-            loss_density = l1_rho
-
         elif self.loss_type == "l2":
-            l2_E = l2_loss(E_pred, gt_materials[:, 0])
-            l2_nu = l2_loss(nu_pred, gt_materials[:, 1])
-            l2_rho = l2_loss(rho_pred, gt_materials[:, 2])
-
-            loss = (
-                self.lambda_youngs_modulus * l2_E
-                + self.lambda_poissons_ratio * l2_nu
-                + self.lambda_density * l2_rho
+            errors = (
+                (E_pred - gt_materials[:, 0]) ** 2,
+                (nu_pred - gt_materials[:, 1]) ** 2,
+                (rho_pred - gt_materials[:, 2]) ** 2,
             )
-
-            # Individual loss components for logging
-            loss_youngs = l2_E
-            loss_poisson = l2_nu
-            loss_density = l2_rho
         else:
             raise ValueError(f"Invalid loss type: {self.loss_type}")
+
+        if self.loss_reduction == "voxel":
+            local_sums = torch.stack([error.sum() for error in errors])
+            local_count = gt_materials.shape[0]
+        else:
+            if segment_ids is None:
+                raise ValueError("object_segment loss requires segment IDs")
+            voxel_errors = torch.stack(errors, dim=-1)
+            object_losses = []
+            for layout in materials.layout:
+                object_errors = voxel_errors[layout]
+                object_segments = segment_ids.feats[layout, 0].long()
+                _, inverse, counts = torch.unique(
+                    object_segments,
+                    return_inverse=True,
+                    return_counts=True,
+                )
+                segment_sums = object_errors.new_zeros((len(counts), 3))
+                segment_sums.index_add_(0, inverse, object_errors)
+                segment_mean = (segment_sums / counts.unsqueeze(-1)).mean(dim=0)
+                object_losses.append(
+                    0.5 * object_errors.mean(dim=0) + 0.5 * segment_mean
+                )
+            local_sums = torch.stack(object_losses).sum(dim=0)
+            local_count = len(object_losses)
+
+        if self.world_size > 1:
+            global_stats = torch.cat(
+                [local_sums.detach(), local_sums.new_tensor([local_count])]
+            )
+            dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
+            global_count = global_stats[-1]
+            gradient_means = local_sums * self.world_size / global_count
+            global_means = global_stats[:3] / global_count
+            loss_youngs, loss_poisson, loss_density = (
+                gradient_means + (global_means - gradient_means.detach())
+            )
+        else:
+            loss_youngs, loss_poisson, loss_density = local_sums / local_count
+
+        loss = (
+            self.lambda_youngs_modulus * loss_youngs
+            + self.lambda_poissons_ratio * loss_poisson
+            + self.lambda_density * loss_density
+        )
 
         if return_aux:
             return loss, {"latent_2d": z}
@@ -520,7 +556,7 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
                 materials = data["materials"]
 
                 # Same forward pass as training_losses
-                z, mean, logvar = self.training_models["geometry_encoder"](
+                z, mean, logvar = self.models["geometry_encoder"](
                     feats, sample_posterior=False, return_raw=True
                 )
                 gt_materials_normalized = (
@@ -549,9 +585,7 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
 
                 elif self.training_mode == "encoder_decoder_matvae":
                     # New mode: encoder → decoder → matvae
-                    decoder_output = self.models["decoder"](
-                        z
-                    )  # Should output 2D latents
+                    decoder_output = self.models["decoder"](z)  # Should output 2D latents
                     latent_2d = decoder_output.feats  # Shape: [num_voxels, 2]
 
                     # Get predictions from material VAE
@@ -572,12 +606,8 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
 
                 elif self.training_mode == "encoder_decoder_direct":
                     # New mode: encoder → decoder → direct 3D outputs
-                    decoder_output = self.models["decoder"](
-                        z
-                    )  # Should output 3D materials
-                    material_predictions = (
-                        decoder_output.feats
-                    )  # Shape: [num_voxels, 3]
+                    decoder_output = self.models["decoder"](z)  # Should output 3D materials
+                    material_predictions = decoder_output.feats  # Shape: [num_voxels, 3]
 
                     # Extract predictions directly
                     E_pred = material_predictions[:, 0]  # Shape: [total_voxels]
@@ -680,7 +710,9 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
                 val_metrics["val_rel_error_log_youngs"] = rel_error_log_E.mean().item()
 
                 # Poisson's ratio relative error in original space
-                rel_error_nu = torch.abs(pred_nu - gt_nu) / torch.abs(gt_nu)
+                rel_error_nu = torch.abs(pred_nu - gt_nu) / torch.clamp_min(
+                    torch.abs(gt_nu), 1e-6
+                )
                 val_metrics["val_rel_error_poisson"] = rel_error_nu.mean().item()
 
                 # Density relative error in original space
@@ -695,7 +727,6 @@ class SLatVaeMaterialsTrainer(BasicTrainer):
 
         except Exception as e:
             print(f"Error during validation: {e}")
-            import traceback
 
             traceback.print_exc()
             val_metrics = {}

@@ -1,0 +1,58 @@
+{
+    "dry_run": false,
+    "standard_vae": true,
+    "data_csv": "datasets/latent_space/materials_filtered_vae.csv",
+    "validation_csv": "datasets/latent_space/materials_validation_vae.csv",
+    "dataloader": {
+        "batch_size": 256,
+        "num_workers": 8,
+        "pin_memory": true,
+        "prefetch_factor": 4,
+        "persistent_workers": true
+    },
+    "project_dir": "outputs/vomp1.1/matvae",
+    "tracker_name": "tb_logs",
+    "log_with": "tensorboard",
+    "epochs": 120,
+    "gradient_accumulation_steps": 1,
+    "keep_last_checkpoints": 4,
+    "mixed_precision": "no",
+    "use_stateful_dataloader": false,
+    "find_unused_parameters": false,
+    "optimizer": {
+        "lr": 5e-05,
+        "weight_decay": 0.0001,
+        "grad_clip_norm": 5.0
+    },
+    "lr_scheduler": {
+        "type": "cosine",
+        "t_max_epochs": 160,
+        "eta_min": 1e-05
+    },
+    "free_nats": 0.0,
+    "kl_annealing": true,
+    "kl_annealing_epochs": 20,
+    "recon_scale": 1.0,
+    "kl_weight": 3e-06,
+    "iwae_K": 50,
+    "normalization_type": "log_minmax",
+    "eval_interval": 5,
+    "save_interval": 5,
+    "model": {
+        "width": 256,
+        "depth": 3,
+        "z_dim": 2,
+        "p_drop": 0.05,
+        "init_logvar": -2.0,
+        "use_learned_variances": false,
+        "use_additional_losses": true,
+        "use_flow": false,
+        "reconstruction_weights": [
+            1.9429298,
+            0.7528426,
+            0.3042276
+        ]
+    },
+    "seed": 42,
+    "resume_from_checkpoint": null
+}

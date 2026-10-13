@@ -35,6 +35,10 @@ from vomp.fem.fem_examples.mfem.mfem_3d import MFEM_RS_F, MFEM_sF_S
 from vomp.fem.fem_examples.mfem.collisions import CollisionHandler
 
 import warp.examples.fem.utils as fem_example_utils
+from scipy.spatial import KDTree
+import polyscope as ps
+import polyscope.imgui as psim
+import time
 
 # Demo app
 
@@ -187,7 +191,6 @@ def assign_spatially_varying_materials(sim, voxel_positions, materials, voxel_si
     Returns:
         E_cells: numpy array of Young's modulus values per cell (for visualization)
     """
-    from scipy.spatial import KDTree
 
     print(f"\n=== SPATIALLY VARYING MATERIAL ASSIGNMENT ===")
 
@@ -635,9 +638,6 @@ if __name__ == "__main__":
         print("Starting playback visualization...")
 
         # Now set up the UI for playback
-        import polyscope as ps
-        import polyscope.imgui as psim
-        import time
 
         ps.init()
         ps.set_ground_plane_mode("tile")

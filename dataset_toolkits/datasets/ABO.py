@@ -20,7 +20,7 @@ import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import pandas as pd
-from utils import get_file_hash
+from dataset_toolkits.utils import get_file_hash
 
 
 def add_args(parser: argparse.ArgumentParser):
@@ -95,10 +95,6 @@ def download(metadata, output_dir, **kwargs):
 def foreach_instance(
     metadata, output_dir, func, max_workers=None, desc="Processing objects"
 ) -> pd.DataFrame:
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-    from tqdm import tqdm
-
     # load metadata
     metadata = metadata.to_dict("records")
 

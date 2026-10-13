@@ -112,13 +112,13 @@ class BasicTrainer(Trainer):
             self.training_models = self.models
 
         # Build master params
-        self.model_params = sum(
-            [
-                [p for p in model.parameters() if p.requires_grad]
-                for model in self.models.values()
-            ],
-            [],
-        )
+        named_model_params = [
+            (f"{model_name}.{param_name}", param)
+            for model_name, model in self.models.items()
+            for param_name, param in model.named_parameters()
+            if param.requires_grad
+        ]
+        self.model_params = [param for _, param in named_model_params]
         if self.fp16_mode == "amp":
             self.master_params = self.model_params
             self.scaler = torch.GradScaler() if self.fp16_mode == "amp" else None
@@ -130,6 +130,30 @@ class BasicTrainer(Trainer):
             self.master_params = self.model_params
         else:
             raise NotImplementedError(f"FP16 mode {self.fp16_mode} is not implemented.")
+
+        self._parameter_lr_multiplier_slices = []
+        if self.parameter_lr_multipliers:
+            if self.fp16_mode != "inflat_all":
+                raise ValueError(
+                    "parameter_lr_multipliers currently requires fp16_mode='inflat_all'"
+                )
+            known_names = {name for name, _ in named_model_params}
+            unknown_names = set(self.parameter_lr_multipliers) - known_names
+            if unknown_names:
+                raise ValueError(
+                    f"Unknown parameter_lr_multipliers entries: {sorted(unknown_names)}"
+                )
+            offset = 0
+            for name, param in named_model_params:
+                end = offset + param.numel()
+                multiplier = float(self.parameter_lr_multipliers.get(name, 1.0))
+                if not np.isfinite(multiplier) or multiplier <= 0:
+                    raise ValueError(f"Learning-rate multiplier for {name} must be positive")
+                if multiplier != 1.0:
+                    self._parameter_lr_multiplier_slices.append(
+                        (slice(offset, end), multiplier)
+                    )
+                offset = end
 
         # Build EMA params
         if self.is_master:
@@ -185,6 +209,24 @@ class BasicTrainer(Trainer):
                 self.grad_clip = getattr(grad_clip_utils, self.grad_clip["name"])(
                     **self.grad_clip["args"]
                 )
+
+    def _optimizer_step_with_parameter_lr_multipliers(self):
+        if not self._parameter_lr_multiplier_slices:
+            self.optimizer.step()
+            return
+
+        master_param = self.master_params[0]
+        previous = [
+            master_param[parameter_slice].detach().clone()
+            for parameter_slice, _ in self._parameter_lr_multiplier_slices
+        ]
+        self.optimizer.step()
+        with torch.no_grad():
+            for (parameter_slice, multiplier), old_value in zip(
+                self._parameter_lr_multiplier_slices, previous
+            ):
+                updated = master_param[parameter_slice]
+                updated.copy_(old_value + multiplier * (updated - old_value))
 
     def _master_params_to_state_dicts(self, master_params):
         """
@@ -518,7 +560,7 @@ class BasicTrainer(Trainer):
                 if self.grad_clip is None:
                     model_grads_to_master_grads(self.model_params, self.master_params)
                     self.master_params[0].grad.mul_(1.0 / (2**self.log_scale))
-                self.optimizer.step()
+                self._optimizer_step_with_parameter_lr_multipliers()
                 master_params_to_model_params(self.model_params, self.master_params)
                 self.log_scale += self.fp16_scale_growth
             else:

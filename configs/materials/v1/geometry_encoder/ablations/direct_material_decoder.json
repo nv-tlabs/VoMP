@@ -1,5 +1,6 @@
 {
-    "matvae_checkpoint": "outputs/matvae2/checkpoints/checkpoint_853/model.safetensors",
+    "training_mode": "encoder_decoder_direct",
+    "matvae_checkpoint": "outputs/vomp1/matvae/final_model/model.safetensors",
     "trellis_weights_path": "weights/TRELLIS-image-large",
     "models": {
         "geometry_encoder": {
@@ -8,7 +9,7 @@
                 "resolution": 64,
                 "in_channels": 1024,
                 "model_channels": 768,
-                "latent_channels": 2,
+                "latent_channels": 8,
                 "num_blocks": 12,
                 "num_heads": 12,
                 "mlp_ratio": 4,
@@ -17,8 +18,23 @@
                 "use_fp16": true
             }
         },
+        "decoder": {
+            "name": "decoder",
+            "args": {
+                "resolution": 64,
+                "model_channels": 768,
+                "latent_channels": 8,
+                "num_blocks": 12,
+                "out_channels": 3,
+                "num_heads": 12,
+                "mlp_ratio": 4,
+                "attn_mode": "swin",
+                "window_size": 8,
+                "use_fp16": true
+            }
+        },
         "matvae": {
-            "name": "matvae",
+            "name": "TripletVAE",
             "args": {
                 "width": 256,
                 "depth": 3,
@@ -31,7 +47,7 @@
     },
     "dataset": {
         "name": "SparseVoxelMaterials",
-        "normalization_type": "standard",
+        "normalization_type": "log_minmax",
         "args": {
             "roots": "datasets/simready",
             "image_size": 512,
@@ -39,7 +55,10 @@
             "resolution": 64,
             "min_aesthetic_score": 0.0,
             "max_num_voxels": 32768,
-            "compute_material_stats": false
+            "compute_material_stats": false,
+            "archive_format": "benchmark",
+            "random_grid_rotation": false,
+            "segment_balanced_sampling": false
         }
     },
     "trainer": {
@@ -51,7 +70,7 @@
             "optimizer": {
                 "name": "AdamW",
                 "args": {
-                    "lr": 1e-4,
+                    "lr": 0.0001,
                     "weight_decay": 0.0
                 }
             },
@@ -75,7 +94,7 @@
                 }
             },
             "i_log": 10,
-            "i_save": 2000,
+            "i_save": 1000,
             "i_eval": 1000,
             "loss_type": "l1"
         }

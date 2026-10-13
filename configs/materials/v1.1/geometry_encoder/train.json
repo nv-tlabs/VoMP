@@ -1,6 +1,5 @@
 {
-    "training_mode": "encoder_decoder_matvae",
-    "matvae_checkpoint": "outputs/matvae/checkpoints/checkpoint_821/model.safetensors",
+    "matvae_checkpoint": "outputs/vomp1.1/matvae/final_model/model.safetensors",
     "trellis_weights_path": "weights/TRELLIS-image-large",
     "models": {
         "geometry_encoder": {
@@ -9,23 +8,8 @@
                 "resolution": 64,
                 "in_channels": 1024,
                 "model_channels": 768,
-                "latent_channels": 8,
+                "latent_channels": 2,
                 "num_blocks": 12,
-                "num_heads": 12,
-                "mlp_ratio": 4,
-                "attn_mode": "swin",
-                "window_size": 8,
-                "use_fp16": true
-            }
-        },
-        "decoder": {
-            "name": "decoder",
-            "args": {
-                "resolution": 64,
-                "model_channels": 768,
-                "latent_channels": 8,
-                "num_blocks": 12,
-                "out_channels": 2,
                 "num_heads": 12,
                 "mlp_ratio": 4,
                 "attn_mode": "swin",
@@ -34,14 +18,15 @@
             }
         },
         "matvae": {
-            "name": "matvae",
+            "name": "StandardVAE",
             "args": {
                 "width": 256,
                 "depth": 3,
                 "z_dim": 2,
                 "p_drop": 0.05,
                 "use_learned_variances": false,
-                "use_additional_losses": true
+                "use_additional_losses": true,
+                "use_flow": false
             }
         }
     },
@@ -55,21 +40,31 @@
             "resolution": 64,
             "min_aesthetic_score": 0.0,
             "max_num_voxels": 32768,
-            "compute_material_stats": false
+            "compute_material_stats": false,
+            "split": "train",
+            "feature_noise_std": 0.05,
+            "archive_format": "mapped",
+            "random_grid_rotation": true,
+            "segment_balanced_sampling": true
         }
     },
     "trainer": {
         "name": "SLatVaeMaterialsTrainer",
         "args": {
-            "max_steps": 1000000,
+            "max_steps": 164000,
             "batch_size_per_gpu": 16,
             "batch_split": 1,
+            "prefetch_data": false,
             "optimizer": {
                 "name": "AdamW",
                 "args": {
-                    "lr": 1e-4,
+                    "lr": 5e-05,
                     "weight_decay": 0.0
                 }
+            },
+            "parameter_lr_multipliers": {
+                "geometry_encoder.out_layer.weight": 10.0,
+                "geometry_encoder.out_layer.bias": 10.0
             },
             "ema_rate": [
                 0.9999
@@ -83,17 +78,12 @@
                     "max_mem_ratio_start": 0.5
                 }
             },
-            "grad_clip": {
-                "name": "AdaptiveGradClipper",
-                "args": {
-                    "max_norm": 1.0,
-                    "clip_percentile": 95
-                }
-            },
+            "grad_clip": null,
             "i_log": 10,
-            "i_save": 1000,
+            "i_save": 2000,
             "i_eval": 1000,
-            "loss_type": "l1"
+            "loss_type": "l2"
         }
-    }
-} 
+    },
+    "normalization_params_path": "outputs/vomp1.1/matvae/normalization_params.json"
+}

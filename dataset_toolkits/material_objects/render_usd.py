@@ -14,1163 +14,1353 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Clean USD rendering pipeline.
+"""Render material objects from 150 viewpoints using the VLM renderer's USD loader."""
 
-This script extracts meshes and textures directly from USD files,
-similar to how Omniverse exports meshes. It does NOT search the filesystem
-for textures - all texture paths come from the USD shaders themselves.
+from __future__ import annotations
 
-For vegetation datasets that use MDL materials, it parses the MDL files
-to extract texture references.
-"""
-
-import os
-import sys
-import json
-import re
 import argparse
-import tempfile
-import shutil
+import hashlib
+import json
+import math
+import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from collections import defaultdict
-from subprocess import call, DEVNULL
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
-from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf
+from PIL import Image
+from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from utils import sphere_hammersley_sequence
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-BLENDER_LINK = (
-    "https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz"
+from dataset_toolkits.material_objects.camera import (
+    CAMERA_FOV,
+    CAMERA_FRAME_FRACTION,
+    CAMERA_NOMINAL_RADIUS,
+    CAMERA_SENSOR_SIZE_MM,
+    DEFAULT_NUM_VIEWS,
+    RESOLUTION,
+    _camera_frame,
+    _camera_radius,
+    _camera_samples,
 )
-BLENDER_INSTALLATION_PATH = "/tmp"
-BLENDER_PATH = f"{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender"
+from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
+    extract_materials_from_usd as extract_common_materials,
+    extract_simready_materials_from_usd as extract_simready_materials,
+)
+from dataset_toolkits.material_objects.vlm_annotations.asset_finder import DEFAULT_DATASET_ROOTS
+from dataset_toolkits.material_objects.vlm_annotations import segment_textured_renderer as textured
+import bpy
+from mathutils import Matrix, Vector
+from dataset_toolkits.material_objects.vlm_annotations.segment_visual_inputs import (
+    build_asset_geometry_payloads,
+)
+from dataset_toolkits.material_objects.vlm_annotations.annotation_input_policy import (
+    asset_annotation_exclusion,
+)
+from dataset_toolkits.datasets.allmats import get_metadata as get_asset_inventory
 
 
-class USDMaterialExtractor:
-    """
-    Extracts materials and textures directly from USD files.
+CYCLES_SAMPLES = 128
+ALPHA_MASK_SAMPLES = 8
+WORLD_COLOR = (0.18, 0.18, 0.18)
+WORLD_STRENGTH = 0.8
+AREA_LIGHT_STRENGTH = 40.0
+AREA_LIGHT_SIZE = 4.0
 
-    This class reads shader inputs from USD prims and resolves texture paths
-    relative to the USD file. For MDL materials (used in vegetation), it
-    parses the MDL files to extract texture references.
-    """
 
-    # MDL texture patterns (for vegetation)
-    MDL_TEXTURE_PATTERNS = [
-        r'diffuse_texture:\s*texture_2d\("([^"]+)"',
-        r'normalmap_texture:\s*texture_2d\("([^"]+)"',
-        r'reflectionroughness_texture:\s*texture_2d\("([^"]+)"',
-        r'metallic_texture:\s*texture_2d\("([^"]+)"',
-        r'ORM_texture:\s*texture_2d\("([^"]+)"',
+class RenderError(RuntimeError):
+    pass
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _input_file_records(
+    source: Path,
+    geometry_payloads: Mapping[str, Any],
+    plans: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    records: dict[str, str] = {}
+
+    def add(path_value: Any, sha256_value: Any) -> None:
+        if not isinstance(path_value, str) or not isinstance(sha256_value, str):
+            return
+        path = Path(path_value).expanduser()
+        if not path.is_absolute() or not path.is_file():
+            return
+        path = path.resolve()
+        previous = records.get(str(path))
+        if previous is not None:
+            if previous != sha256_value:
+                raise RenderError(f"conflicting input hashes for {path}")
+            return
+        actual = _sha256_file(path)
+        if actual != sha256_value:
+            raise RenderError(f"input hash changed while planning render: {path}")
+        records[str(path)] = sha256_value
+
+    records[str(source.resolve())] = _sha256_file(source)
+    for payload in geometry_payloads.values():
+        for record in payload.provenance.get("used_layers") or ():
+            if isinstance(record, Mapping):
+                add(record.get("real_path"), record.get("content_sha256"))
+    for plan in plans.values():
+        for texture in plan.textures:
+            if texture.tiles:
+                for tile in texture.tiles:
+                    add(tile.path, tile.file_sha256)
+            else:
+                add(texture.path, texture.file_sha256)
+
+        def walk(value: Any) -> None:
+            if isinstance(value, Mapping):
+                for path_key, hash_key in (
+                    ("resolved_source_path", "source_sha256"),
+                    ("resolved_path", "file_sha256"),
+                    ("real_path", "content_sha256"),
+                    ("path", "file_sha256"),
+                ):
+                    add(value.get(path_key), value.get(hash_key))
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    walk(child)
+
+        walk(plan.model_parameters)
+    return [
+        {"path": path, "sha256": records[path]}
+        for path in sorted(records)
     ]
 
-    def __init__(self, usd_path: str, verbose: bool = False):
-        self.usd_path = Path(usd_path).resolve()
-        self.usd_dir = self.usd_path.parent
-        self.verbose = verbose
-        self.stage = None
 
-        # Extracted data
-        self.materials = {}  # material_path -> {input_name: texture_path}
-        self.meshes = {}  # mesh_path -> {name, material, vertices, faces, uvs}
-        self.mesh_materials = {}  # mesh_path -> material_path
-
-    def _log(self, msg: str):
-        if self.verbose:
-            print(msg)
-
-    def _resolve_texture_path(self, texture_path: str) -> Optional[Path]:
-        texture_path = texture_path.strip("@")
-
-        # Handle UDIM textures - replace <UDIM> with first available tile
-        if "<UDIM>" in texture_path:
-            # Try common UDIM tile numbers
-            for udim in ["1001", "1002", "1003", "1004"]:
-                resolved = self._resolve_texture_path(
-                    texture_path.replace("<UDIM>", udim)
-                )
-                if resolved:
-                    return resolved
-            return None
-
-        # Already absolute
-        if Path(texture_path).is_absolute():
-            p = Path(texture_path)
-            return p if p.exists() else None
-
-        # Try relative to USD directory
-        candidates = [
-            self.usd_dir / texture_path,
-            self.usd_dir / "textures" / Path(texture_path).name,
-            self.usd_dir / "Textures" / Path(texture_path).name,
-            self.usd_dir / ".." / texture_path,
-            self.usd_dir / ".." / "textures" / Path(texture_path).name,
-            self.usd_dir / ".." / "materials" / "textures" / Path(texture_path).name,
-        ]
-
-        for p in candidates:
-            if p.exists():
-                return p.resolve()
-
-        # Fuzzy matching: look for files containing the texture name
-        texture_name = Path(texture_path).stem  # e.g., "Iron_BaseColor"
-        texture_ext = Path(texture_path).suffix  # e.g., ".png"
-
-        # Search in Textures folders
-        search_dirs = [
-            self.usd_dir / "Textures",
-            self.usd_dir / "textures",
-            self.usd_dir / ".." / "Textures",
-            self.usd_dir / ".." / "textures",
-        ]
-
-        for search_dir in search_dirs:
-            if search_dir.exists():
-                for f in search_dir.iterdir():
-                    # Check if the file contains the texture name (fuzzy match)
-                    if (
-                        texture_name in f.stem
-                        and f.suffix.lower() == texture_ext.lower()
-                    ):
-                        self._log(f"    (fuzzy match: {texture_name} -> {f.name})")
-                        return f.resolve()
-
-        return None
-
-    def _categorize_input(self, name: str) -> str:
-        name_lower = name.lower()
-
-        # Check for texture/color type based on common patterns
-        if any(
-            x in name_lower for x in ["diffuse", "albedo", "basecolor", "base_color"]
-        ):
-            return "diffuse"
-        elif any(x in name_lower for x in ["normal", "bump"]):
-            return "normal"
-        elif any(x in name_lower for x in ["rough"]):
-            return "roughness"
-        elif any(x in name_lower for x in ["metal"]):
-            return "metallic"
-        elif any(x in name_lower for x in ["orm", "occlusion"]):
-            return "orm"
-        elif any(x in name_lower for x in ["opacity", "alpha"]):
-            return "opacity"
-        else:
-            return name  # Use original name if no match
-
-    def _find_fallback_textures(self, material_name: str) -> Dict[str, str]:
-        textures = {}
-
-        # Search in Textures folders
-        search_dirs = [
-            self.usd_dir / "Textures",
-            self.usd_dir / "textures",
-        ]
-
-        for search_dir in search_dirs:
-            if not search_dir.exists():
-                continue
-
-            # Find all unique texture prefixes (e.g., BlueRug from BlueRug_BaseColor.png)
-            texture_files = list(search_dir.glob("*.png")) + list(
-                search_dir.glob("*.jpg")
-            )
-            if not texture_files:
-                continue
-
-            # Group by prefix (before _BaseColor, _N, _R, etc.)
-            prefixes = set()
-            for f in texture_files:
-                stem = f.stem
-                for suffix in [
-                    "_BaseColor",
-                    "_basecolor",
-                    "_A",
-                    "_albedo",
-                    "_diffuse",
-                    "_N",
-                    "_Normal",
-                    "_normal",
-                    "_R",
-                    "_Roughness",
-                    "_roughness",
-                ]:
-                    if suffix in stem:
-                        prefix = stem.split(suffix)[0]
-                        prefixes.add(prefix)
-                        break
-
-            # Use the first available texture set
-            if prefixes:
-                prefix = sorted(prefixes)[0]  # Pick first alphabetically
-                self._log(f"    (fallback: using {prefix}_* textures)")
-
-                # Find matching textures
-                for f in texture_files:
-                    if f.stem.startswith(prefix):
-                        stem_lower = f.stem.lower()
-                        if any(
-                            x in stem_lower
-                            for x in ["basecolor", "_a", "albedo", "diffuse"]
-                        ):
-                            textures["diffuse"] = str(f.resolve())
-                            self._log(f"    ✓ fallback diffuse: {f.name}")
-                        elif any(x in stem_lower for x in ["normal", "_n"]):
-                            textures["normal"] = str(f.resolve())
-                            self._log(f"    ✓ fallback normal: {f.name}")
-                        elif any(x in stem_lower for x in ["rough", "_r"]):
-                            textures["roughness"] = str(f.resolve())
-                            self._log(f"    ✓ fallback roughness: {f.name}")
-
-                if textures:
-                    return textures
-
-        return textures
-
-    def _extract_textures_from_shader(self, shader: UsdShade.Shader) -> Dict[str, any]:
-        result = {}
-
-        for shader_input in shader.GetInputs():
-            val = shader_input.Get()
-            if val is None:
-                continue
-
-            input_name = shader_input.GetBaseName()
-            category = self._categorize_input(input_name)
-
-            # Texture path (AssetPath)
-            if isinstance(val, Sdf.AssetPath) and val.path:
-                texture_path = val.path.strip("@")
-                resolved = self._resolve_texture_path(texture_path)
-                if resolved:
-                    result[category] = str(resolved)
-                    self._log(f"    ✓ {input_name} -> {category}: {resolved.name}")
-                else:
-                    self._log(f"    ✗ {input_name}: {texture_path} (not resolved)")
-
-            # Color value (Vec3)
-            elif (
-                hasattr(val, "__len__")
-                and len(val) == 3
-                and "color" in input_name.lower()
-            ):
-                result[f"{category}_color"] = (
-                    float(val[0]),
-                    float(val[1]),
-                    float(val[2]),
-                )
-                self._log(
-                    f"    ✓ {input_name} -> {category}_color: ({val[0]:.3f}, {val[1]:.3f}, {val[2]:.3f})"
-                )
-
-        return result
-
-    def _extract_textures_from_mdl(self, mdl_path: Path) -> Dict[str, str]:
-        textures = {}
-
-        if not mdl_path.exists():
-            return textures
-
-        try:
-            content = mdl_path.read_text()
-
-            # Parse texture references
-            type_mapping = {
-                "diffuse_texture": "diffuse",
-                "normalmap_texture": "normal",
-                "reflectionroughness_texture": "roughness",
-                "metallic_texture": "metallic",
-                "ORM_texture": "orm",
-            }
-
-            for tex_type, canonical_name in type_mapping.items():
-                pattern = rf'{tex_type}:\s*texture_2d\("([^"]+)"'
-                match = re.search(pattern, content)
-                if match:
-                    rel_path = match.group(1)
-                    # MDL paths are relative to the MDL file location
-                    resolved = self._resolve_texture_path(rel_path)
-                    if not resolved:
-                        # Try relative to MDL file directory
-                        mdl_dir = mdl_path.parent
-                        candidates = [
-                            mdl_dir / rel_path,
-                            mdl_dir / "textures" / Path(rel_path).name,
-                        ]
-                        for c in candidates:
-                            if c.exists():
-                                resolved = c.resolve()
-                                break
-
-                    if resolved:
-                        textures[canonical_name] = str(resolved)
-                        self._log(f"    ✓ {canonical_name}: {resolved.name} (from MDL)")
-                    else:
-                        self._log(
-                            f"    ✗ {canonical_name}: {rel_path} (MDL, not resolved)"
-                        )
-
-        except Exception as e:
-            self._log(f"    Error parsing MDL {mdl_path}: {e}")
-
-        return textures
-
-    def _find_mdl_for_material(self, material_prim: Usd.Prim) -> Optional[Path]:
-        for child in material_prim.GetChildren():
-            if child.GetTypeName() == "Shader":
-                # Check for MDL source asset
-                mdl_attr = child.GetAttribute("info:mdl:sourceAsset")
-                if mdl_attr and mdl_attr.Get():
-                    mdl_path_val = mdl_attr.Get()
-                    if isinstance(mdl_path_val, Sdf.AssetPath) and mdl_path_val.path:
-                        mdl_rel = mdl_path_val.path.strip("@")
-
-                        # Try to resolve MDL path
-                        candidates = [
-                            self.usd_dir / mdl_rel,
-                            self.usd_dir / "materials" / Path(mdl_rel).name,
-                            self.usd_dir / ".." / "materials" / Path(mdl_rel).name,
-                        ]
-
-                        for c in candidates:
-                            if c.exists():
-                                return c.resolve()
-
-        return None
-
-    def _get_geomsubset_bindings(
-        self, mesh_prim: Usd.Prim
-    ) -> Dict[str, Tuple[str, List[int]]]:
-        bindings = {}
-
-        for child in mesh_prim.GetChildren():
-            if child.GetTypeName() == "GeomSubset":
-                subset_name = child.GetName()
-
-                # Get face indices for this subset
-                indices_attr = child.GetAttribute("indices")
-                face_indices = (
-                    list(indices_attr.Get())
-                    if indices_attr and indices_attr.Get()
-                    else []
-                )
-
-                # Get material binding
-                mat_path = None
-                binding_rel = child.GetRelationship("material:binding")
-                if binding_rel:
-                    targets = binding_rel.GetTargets()
-                    if targets:
-                        mat_path = str(targets[0])
-
-                if mat_path:
-                    bindings[subset_name] = (mat_path, face_indices)
-
-        return bindings
-
-    def extract(self) -> bool:
-        try:
-            self.stage = Usd.Stage.Open(str(self.usd_path))
-        except Exception as e:
-            print(f"ERROR: Could not open USD: {self.usd_path}")
-            print(f"  {e}")
-            return False
-
-        if not self.stage:
-            return False
-
-        self._log(f"\n=== Extracting from: {self.usd_path.name} ===")
-
-        # Step 1: Find all materials and extract textures
-        self._log("\n--- Materials ---")
-        for prim in self.stage.Traverse():
-            if prim.GetTypeName() == "Material":
-                mat_path = str(prim.GetPath())
-                self._log(f"\nMaterial: {prim.GetName()}")
-
-                textures = {}
-
-                # Try extracting from shader inputs
-                for child in prim.GetChildren():
-                    if child.GetTypeName() == "Shader":
-                        shader = UsdShade.Shader(child)
-                        textures.update(self._extract_textures_from_shader(shader))
-
-                # If no textures found, try MDL
-                if not textures:
-                    mdl_path = self._find_mdl_for_material(prim)
-                    if mdl_path:
-                        self._log(f"  Using MDL: {mdl_path.name}")
-                        textures = self._extract_textures_from_mdl(mdl_path)
-
-                # Fallback: if still no textures, search Textures folder for any available
-                if not textures:
-                    textures = self._find_fallback_textures(prim.GetName())
-
-                self.materials[mat_path] = textures
-
-        # Step 2: Find all meshes and their material bindings
-        self._log("\n--- Meshes ---")
-        for prim in self.stage.Traverse():
-            if prim.GetTypeName() == "Mesh":
-                mesh_path = str(prim.GetPath())
-                mesh_name = prim.GetName()
-
-                # Get direct material binding first
-                binding_api = UsdShade.MaterialBindingAPI(prim)
-                bound_material = binding_api.ComputeBoundMaterial()[0]
-                mat_path = str(bound_material.GetPath()) if bound_material else None
-
-                # Check for GeomSubset bindings (per-face materials)
-                geomsubset_bindings = self._get_geomsubset_bindings(prim)
-
-                # If no direct binding but has GeomSubsets, use first one as default
-                if not mat_path and geomsubset_bindings:
-                    first_subset = list(geomsubset_bindings.values())[0]
-                    mat_path = first_subset[0]
-
-                self.mesh_materials[mesh_path] = mat_path
-
-                # Get mesh geometry
-                mesh = UsdGeom.Mesh(prim)
-                points_local = mesh.GetPointsAttr().Get()
-                face_counts = mesh.GetFaceVertexCountsAttr().Get()
-                face_indices = mesh.GetFaceVertexIndicesAttr().Get()
-
-                # Apply world transform to vertices
-                xformable = UsdGeom.Xformable(prim)
-                world_transform = xformable.ComputeLocalToWorldTransform(
-                    Usd.TimeCode.Default()
-                )
-
-                # Transform points to world space
-                points = []
-                if points_local:
-                    for p in points_local:
-                        # Apply 4x4 transform matrix to point
-                        p_world = world_transform.Transform(Gf.Vec3d(p[0], p[1], p[2]))
-                        points.append(Gf.Vec3f(p_world[0], p_world[1], p_world[2]))
-                else:
-                    points = None
-
-                # Get UVs and check interpolation
-                uvs = None
-                uv_interpolation = None
-                uv_indices = None
-                for primvar_name in ["st", "uvs", "uv", "UVMap", "texCoords"]:
-                    primvar = UsdGeom.PrimvarsAPI(prim).GetPrimvar(primvar_name)
-                    if primvar and primvar.Get():
-                        uvs = primvar.Get()
-                        uv_interpolation = primvar.GetInterpolation()
-                        # For indexed primvars, get the indices
-                        if primvar.IsIndexed():
-                            uv_indices = primvar.GetIndices()
-                        break
-
-                self.meshes[mesh_path] = {
-                    "name": mesh_name,
-                    "material": mat_path,
-                    "points": points,
-                    "face_counts": face_counts,
-                    "face_indices": face_indices,
-                    "uvs": uvs,
-                    "uv_interpolation": uv_interpolation,
-                    "uv_indices": uv_indices,
-                    "geomsubsets": geomsubset_bindings,  # Store GeomSubset bindings
-                }
-
-                has_tex = bool(self.materials.get(mat_path))
-                if geomsubset_bindings:
-                    has_tex = any(
-                        self.materials.get(m) for m, _ in geomsubset_bindings.values()
-                    )
-
-                status = "✓" if has_tex else "○"
-
-                if geomsubset_bindings:
-                    self._log(
-                        f"  {status} {mesh_name} (GeomSubsets: {len(geomsubset_bindings)})"
-                    )
-                    for subset_name, (sub_mat, _) in geomsubset_bindings.items():
-                        sub_mat_name = sub_mat.split("/")[-1] if sub_mat else "none"
-                        self._log(f"      {subset_name} -> {sub_mat_name}")
-                else:
-                    self._log(
-                        f"  {status} {mesh_name} -> {mat_path or '(no material)'}"
-                    )
-
-        if not self.meshes:
-            self._log("WARNING: No meshes found in USD file")
-            return False
-
-        has_valid_mesh = any(
-            mesh_data.get("points") for mesh_data in self.meshes.values()
-        )
-        if not has_valid_mesh:
-            self._log("WARNING: No meshes with valid geometry found")
-            return False
-
-        return True
-
-    def export_obj(
-        self, output_dir: Path, normalize: bool = True
-    ) -> Tuple[Optional[Path], Optional[Path]]:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        obj_path = output_dir / "model.obj"
-        mtl_path = output_dir / "model.mtl"
-
-        # Collect all vertices, faces, UVs
-        all_vertices = []
-        all_faces = []
-        all_uvs = []
-        face_materials = []
-        vertex_offset = 0
-        uv_offset = 0
-
-        material_list = []  # List of unique materials used
-        material_map = {}  # material_path -> index
-
-        for mesh_path, mesh_data in self.meshes.items():
-            if not mesh_data["points"]:
-                continue
-
-            points = mesh_data["points"]
-            face_counts = mesh_data["face_counts"]
-            face_indices = mesh_data["face_indices"]
-            uvs = mesh_data["uvs"]
-            uv_interpolation = mesh_data.get("uv_interpolation")
-            uv_indices = mesh_data.get("uv_indices")
-            mat_path = mesh_data["material"]
-            geomsubsets = mesh_data.get("geomsubsets", {})
-
-            # Add vertices
-            for p in points:
-                all_vertices.append((float(p[0]), float(p[1]), float(p[2])))
-
-            # Add UVs - handle different interpolation modes
-            mesh_uv_offset = len(all_uvs)
-            if uvs:
-                for uv in uvs:
-                    all_uvs.append((float(uv[0]), float(uv[1])))
-
-            # Track UV mapping for this mesh
-            # For faceVarying, we need to map face-vertex index to UV index
-            mesh_data["_uv_offset"] = mesh_uv_offset
-            mesh_data["_has_uvs"] = uvs is not None and len(uvs) > 0
-
-            # Build face-to-material mapping for GeomSubsets
-            face_to_subset_mat = {}
-            if geomsubsets:
-                for subset_name, (
-                    sub_mat_path,
-                    sub_face_indices,
-                ) in geomsubsets.items():
-                    for face_idx in sub_face_indices:
-                        face_to_subset_mat[face_idx] = sub_mat_path
-                    # Ensure this material is in our list
-                    if sub_mat_path and sub_mat_path not in material_map:
-                        material_map[sub_mat_path] = len(material_list)
-                        material_list.append(sub_mat_path)
-
-            # Track default material
-            if mat_path and mat_path not in material_map:
-                material_map[mat_path] = len(material_list)
-                material_list.append(mat_path)
-
-            # Add faces with proper UV indexing
-            idx = 0
-            face_num = 0
-            face_vertex_idx = 0  # Running index for faceVarying UVs
-
-            for count in face_counts:
-                # Determine material for this face
-                if face_num in face_to_subset_mat:
-                    face_mat = face_to_subset_mat[face_num]
-                else:
-                    face_mat = mat_path
-
-                mat_idx = material_map.get(face_mat, 0) if face_mat else 0
-
-                # Determine UV indices based on interpolation mode
-                def get_uv_idx(local_vert_idx, fv_offset):
-                    if not mesh_data["_has_uvs"]:
-                        return None
-                    vertex_idx = face_indices[local_vert_idx]
-
-                    if uv_interpolation == "faceVarying":
-                        if uv_indices is not None:
-                            # Indexed faceVarying: indices are per face-vertex
-                            return mesh_uv_offset + int(uv_indices[fv_offset])
-                        else:
-                            # Non-indexed faceVarying: sequential per face-vertex
-                            return mesh_uv_offset + fv_offset
-                    else:
-                        # vertex interpolation
-                        if uv_indices is not None:
-                            # Indexed vertex: indices are per-vertex
-                            return mesh_uv_offset + int(uv_indices[vertex_idx])
-                        else:
-                            # Non-indexed vertex: UV index matches vertex index
-                            return mesh_uv_offset + vertex_idx
-
-                if count == 3:
-                    v_indices = [
-                        face_indices[idx] + vertex_offset,
-                        face_indices[idx + 1] + vertex_offset,
-                        face_indices[idx + 2] + vertex_offset,
-                    ]
-                    uv_idxs = [
-                        get_uv_idx(idx, face_vertex_idx),
-                        get_uv_idx(idx + 1, face_vertex_idx + 1),
-                        get_uv_idx(idx + 2, face_vertex_idx + 2),
-                    ]
-                    all_faces.append((v_indices, uv_idxs))
-                    face_materials.append(mat_idx)
-                    face_vertex_idx += 3
-                elif count == 4:
-                    # Triangulate quad
-                    v_indices1 = [
-                        face_indices[idx] + vertex_offset,
-                        face_indices[idx + 1] + vertex_offset,
-                        face_indices[idx + 2] + vertex_offset,
-                    ]
-                    v_indices2 = [
-                        face_indices[idx] + vertex_offset,
-                        face_indices[idx + 2] + vertex_offset,
-                        face_indices[idx + 3] + vertex_offset,
-                    ]
-                    uv_idxs1 = [
-                        get_uv_idx(idx, face_vertex_idx),
-                        get_uv_idx(idx + 1, face_vertex_idx + 1),
-                        get_uv_idx(idx + 2, face_vertex_idx + 2),
-                    ]
-                    uv_idxs2 = [
-                        get_uv_idx(idx, face_vertex_idx),
-                        get_uv_idx(idx + 2, face_vertex_idx + 2),
-                        get_uv_idx(idx + 3, face_vertex_idx + 3),
-                    ]
-                    all_faces.append((v_indices1, uv_idxs1))
-                    all_faces.append((v_indices2, uv_idxs2))
-                    face_materials.append(mat_idx)
-                    face_materials.append(mat_idx)
-                    face_vertex_idx += 4
-                else:
-                    # Skip n-gons
-                    face_vertex_idx += count
-
-                idx += count
-                face_num += 1
-
-            vertex_offset += len(points)
-
-        if not all_vertices:
-            return None, None
-
-        # Normalize vertices to fit in [-0.5, 0.5]^3 centered at origin
-        # Use margin factor to ensure object fits fully in camera frame at all angles
-        MARGIN_FACTOR = 0.85  # Scale to 85% of unit cube to leave padding
-
-        if normalize and all_vertices:
-            # Compute bounding box
-            xs = [v[0] for v in all_vertices]
-            ys = [v[1] for v in all_vertices]
-            zs = [v[2] for v in all_vertices]
-
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            min_z, max_z = min(zs), max(zs)
-
-            # Compute center and scale
-            center_x = (min_x + max_x) / 2
-            center_y = (min_y + max_y) / 2
-            center_z = (min_z + max_z) / 2
-
-            extent_x = max_x - min_x
-            extent_y = max_y - min_y
-            extent_z = max_z - min_z
-            max_extent = max(extent_x, extent_y, extent_z)
-
-            if max_extent > 0:
-                # Scale to fit in unit cube, with margin for camera framing
-                scale = MARGIN_FACTOR / max_extent
-            else:
-                scale = 1.0
-
-            # Apply normalization: center then scale
-            all_vertices = [
-                (
-                    (v[0] - center_x) * scale,
-                    (v[1] - center_y) * scale,
-                    (v[2] - center_z) * scale,
-                )
-                for v in all_vertices
-            ]
-
-            self._log(f"\nNormalization applied:")
-            self._log(
-                f"  Original bounds: X[{min_x:.2f}, {max_x:.2f}], Y[{min_y:.2f}, {max_y:.2f}], Z[{min_z:.2f}, {max_z:.2f}]"
-            )
-            self._log(f"  Scale factor: {scale:.6f} (with {MARGIN_FACTOR:.0%} margin)")
-            self._log(
-                f"  Center offset: ({center_x:.2f}, {center_y:.2f}, {center_z:.2f})"
-            )
-
-        # Copy textures and write MTL
-        with open(mtl_path, "w") as f:
-            for mat_path in material_list:
-                mat_name = mat_path.split("/")[-1] if mat_path else "default_material"
-                textures = self.materials.get(mat_path, {})
-
-                f.write(f"newmtl {mat_name}\n")
-                f.write("Ka 0.2 0.2 0.2\n")
-
-                # Use diffuse color constant if available, otherwise default gray
-                if "diffuse_color" in textures:
-                    color = textures["diffuse_color"]
-                    f.write(f"Kd {color[0]:.6f} {color[1]:.6f} {color[2]:.6f}\n")
-                    self._log(
-                        f"  Material {mat_name}: using diffuse color ({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})"
-                    )
-                else:
-                    f.write("Kd 0.8 0.8 0.8\n")
-
-                f.write("Ks 0.2 0.2 0.2\n")
-                f.write("Ns 50.0\n")
-                f.write("d 1.0\n")
-                f.write("illum 2\n")
-
-                for tex_type, tex_value in textures.items():
-                    # Skip color constants (they're tuples, not paths)
-                    if isinstance(tex_value, tuple):
-                        continue
-
-                    tex_path = tex_value
-                    if os.path.exists(tex_path):
-                        # Copy texture to output dir
-                        tex_name = os.path.basename(tex_path)
-                        dest = output_dir / tex_name
-                        if not dest.exists():
-                            shutil.copy2(tex_path, dest)
-
-                        # Write to MTL
-                        if tex_type == "diffuse":
-                            f.write(f"map_Kd {tex_name}\n")
-                        elif tex_type == "normal":
-                            f.write(f"map_Bump {tex_name}\n")
-                        elif tex_type == "roughness":
-                            f.write(f"map_Ns {tex_name}\n")
-                        elif tex_type == "metallic":
-                            f.write(f"map_Ks {tex_name}\n")
-
-                f.write("\n")
-
-        # Write OBJ
-        with open(obj_path, "w") as f:
-            f.write(f"mtllib model.mtl\n\n")
-
-            for v in all_vertices:
-                f.write(f"v {v[0]} {v[1]} {v[2]}\n")
-
-            f.write("\n")
-            for uv in all_uvs:
-                f.write(f"vt {uv[0]} {uv[1]}\n")
-
-            f.write("\n")
-
-            # Group faces by material
-            mat_faces = defaultdict(list)
-            for i, face_data in enumerate(all_faces):
-                mat_faces[face_materials[i]].append(face_data)
-
-            for mat_idx, faces in mat_faces.items():
-                mat_path = (
-                    material_list[mat_idx] if mat_idx < len(material_list) else None
-                )
-                mat_name = mat_path.split("/")[-1] if mat_path else "default_material"
-
-                f.write(f"usemtl {mat_name}\n")
-                for face_data in faces:
-                    v_indices, uv_indices = face_data
-                    # OBJ indices are 1-based
-                    if uv_indices[0] is not None:
-                        # Include UV indices
-                        f.write(
-                            f"f {v_indices[0]+1}/{uv_indices[0]+1} {v_indices[1]+1}/{uv_indices[1]+1} {v_indices[2]+1}/{uv_indices[2]+1}\n"
-                        )
-                    else:
-                        # No UVs, just vertex indices
-                        f.write(
-                            f"f {v_indices[0]+1} {v_indices[1]+1} {v_indices[2]+1}\n"
-                        )
-                f.write("\n")
-
-        return obj_path, mtl_path
-
-
-def _install_blender():
-    if not os.path.exists(BLENDER_PATH):
-        os.system("sudo apt-get update")
-        os.system(
-            "sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6"
-        )
-        os.system(f"wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}")
-        os.system(
-            f"tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}"
-        )
-
-
-def render_usd(
-    usd_path: str,
-    output_dir: str,
-    num_views: int = 150,
-    resolution: int = 512,
-    verbose: bool = False,
-) -> bool:
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Extract mesh and materials from USD
-    extractor = USDMaterialExtractor(usd_path, verbose=verbose)
-    if not extractor.extract():
-        print(f"Failed to extract from USD: {usd_path}")
+def _manifest_inputs_are_current(manifest: Mapping[str, Any]) -> bool:
+    records = manifest.get("input_files")
+    if not isinstance(records, list) or not records:
         return False
-
-    # Export to OBJ + MTL
-    temp_dir = tempfile.mkdtemp()
-    try:
-        # Don't normalize - let Blender's normalize_scene() handle it
-        obj_path, mtl_path = extractor.export_obj(Path(temp_dir), normalize=False)
-        if not obj_path:
-            print(f"Failed to export OBJ from USD: {usd_path}")
+    seen = set()
+    for record in records:
+        if not isinstance(record, Mapping):
             return False
+        path_value = record.get("path")
+        expected = record.get("sha256")
+        if not isinstance(path_value, str) or not isinstance(expected, str):
+            return False
+        path = Path(path_value)
+        if path_value in seen or not path.is_absolute() or not path.is_file():
+            return False
+        seen.add(path_value)
+        if _sha256_file(path) != expected:
+            return False
+    return True
 
-        if verbose:
-            print(f"\nExported to: {obj_path}")
-            # List textures
-            textures = list(Path(temp_dir).glob("*.png")) + list(
-                Path(temp_dir).glob("*.tga")
-            )
-            if textures:
-                print(f"Textures copied: {len(textures)}")
-                for t in textures:
-                    print(f"  - {t.name}")
 
-        # Generate camera views
-        yaws = []
-        pitchs = []
-        offset = (np.random.rand(), np.random.rand())
-        for i in range(num_views):
-            y, p = sphere_hammersley_sequence(i, num_views, offset)
-            yaws.append(y)
-            pitchs.append(p)
-        # Radius 2.5 ensures object corners fit in frame:
-        # Object diagonal at 0.866 from center, visible range at radius=2.5, FOV=40° is ±0.91
-        radius = [2.1] * num_views
-        fov = [40 / 180 * np.pi] * num_views
-        views = [
-            {"yaw": y, "pitch": p, "radius": r, "fov": f}
-            for y, p, r, f in zip(yaws, pitchs, radius, fov)
-        ]
-
-        # Call Blender
-        blender_script = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "dataset_toolkits",
-            "blender_script",
-            "render.py",
+def _extract_asset(source: Path, dataset: str) -> dict[str, Any]:
+    if dataset == "simready":
+        result = extract_simready_materials(
+            str(source), source.parent.name, str(source.parent)
         )
-
-        args = [
-            BLENDER_PATH,
-            "-b",
-            "-P",
-            blender_script,
-            "--",
-            "--views",
-            json.dumps(views),
-            "--object",
-            str(obj_path),
-            "--resolution",
-            str(resolution),
-            "--output_folder",
-            output_dir,
-            "--engine",
-            "CYCLES",
-            "--save_mesh",
-            "--use_gpu",  # Enable GPU acceleration
-        ]
-
-        if verbose:
-            print(f"\nRunning Blender...")
-
-        call(
-            args,
-            stdout=DEVNULL if not verbose else None,
-            stderr=DEVNULL if not verbose else None,
-        )
-
-        success = os.path.exists(os.path.join(output_dir, "transforms.json"))
-        return success
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def _render_worker(
-    file_path: str,
-    sha256: str,
-    dataset: str,
-    output_dir: str,
-    num_views: int,
-    quiet: bool,
-) -> Optional[Dict]:
-    output_folder = os.path.join(output_dir, "renders", sha256)
-
-    # Skip if already rendered
-    if os.path.exists(os.path.join(output_folder, "transforms.json")):
-        return {"sha256": sha256, "rendered": True}
-
-    success = render_usd(
-        file_path,
-        output_folder,
-        num_views=num_views,
-        resolution=512,
-        verbose=not quiet,
-    )
-
-    if success:
-        return {"sha256": sha256, "rendered": True}
     else:
-        if not quiet:
-            print(f"Failed to render: {file_path}")
+        result = extract_common_materials(str(source), dataset)
+    if not isinstance(result, dict) or not result.get("segments"):
+        raise RenderError(f"material extraction returned no segments for {source}")
+    return result
+
+
+def _asset_key(source: Path, dataset: str) -> str | None:
+    root = DEFAULT_DATASET_ROOTS.get(dataset)
+    if root is None:
         return None
+    try:
+        relative = source.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+    return f"{dataset}/{relative}"
 
 
-def main_batch():
-    import importlib
-    import copy
-    from functools import partial
-    from easydict import EasyDict as edict
+def _visible_bounds(
+    segments: Mapping[str, Any], geometry_payloads: Mapping[str, Any]
+) -> tuple[np.ndarray, float, np.ndarray]:
+    minimum = np.full(3, np.inf, dtype=np.float64)
+    maximum = np.full(3, -np.inf, dtype=np.float64)
+    occurrence_points: list[np.ndarray] = []
 
-    # First argument is dataset type (e.g., "allmats")
-    dataset_utils = importlib.import_module(f"dataset_toolkits.datasets.{sys.argv[1]}")
+    for key in sorted(segments):
+        if not textured._render_content(segments[key]):
+            continue
+        payload = geometry_payloads[key]
+        points = np.asarray(payload.points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points):
+            continue
+        for transform in payload.occurrence_transforms:
+            transformed = textured._transform_points(points, transform)
+            minimum = np.minimum(minimum, transformed.min(axis=0))
+            maximum = np.maximum(maximum, transformed.max(axis=0))
+            occurrence_points.append(transformed)
 
-    parser = argparse.ArgumentParser(
-        description="Batch render USD files with proper texture extraction"
+    if not occurrence_points or not np.isfinite(minimum).all() or not np.isfinite(maximum).all():
+        raise RenderError("asset has no finite visible render geometry")
+    extent = maximum - minimum
+    scale = float(extent.max())
+    if not math.isfinite(scale) or scale <= 1.0e-12:
+        raise RenderError("asset visible bounds are degenerate")
+    center = (minimum + maximum) * 0.5
+    normalized_points = (np.concatenate(occurrence_points, axis=0) - center) / scale
+    return center, scale, normalized_points
+
+
+def _write_normalized_mesh(
+    output_dir: Path,
+    renderables: list[Any],
+    segments: Mapping[str, Any],
+    center: np.ndarray,
+    scale: float,
+) -> dict[str, Any]:
+    segment_keys = sorted(
+        key for key, segment in segments.items() if textured._render_content(segment)
     )
-    parser.add_argument(
-        "--output_dir", type=str, required=True, help="Directory to save renders"
-    )
-    parser.add_argument(
-        "--filter_low_aesthetic_score",
-        type=float,
-        default=None,
-        help="Filter objects with aesthetic score lower than this value",
-    )
-    parser.add_argument(
-        "--instances",
-        type=str,
-        default=None,
-        help="Instances to process (comma-separated or file path)",
-    )
-    parser.add_argument(
-        "--num_views", type=int, default=150, help="Number of views to render"
-    )
-    parser.add_argument(
-        "--rank", type=int, default=0, help="Worker rank for distributed processing"
-    )
-    parser.add_argument(
-        "--world_size",
-        type=int,
-        default=1,
-        help="Total workers for distributed processing",
-    )
-    parser.add_argument(
-        "--max_workers", type=int, default=8, help="Number of parallel workers"
-    )
-    parser.add_argument("--quiet", action="store_true", help="Suppress verbose output")
+    segment_keys_sha256 = hashlib.sha256(
+        json.dumps(
+            segment_keys, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    segment_indices = {key: index for index, key in enumerate(segment_keys)}
+    vertex_blocks = []
+    triangle_blocks = []
+    triangle_segment_blocks = []
+    vertex_offset = 0
+    for renderable in renderables:
+        if len(renderable.face_segments) != len(renderable.mesh.polygons):
+            raise RenderError("render mesh face ownership is incomplete")
+        renderable.mesh.calc_loop_triangles()
+        visible_triangles = []
+        visible_triangle_segments = []
+        for triangle in renderable.mesh.loop_triangles:
+            owner = renderable.face_segments[triangle.polygon_index]
+            if not textured._render_content(segments[owner]):
+                continue
+            visible_triangles.append(
+                tuple(int(value) for value in triangle.vertices)
+            )
+            visible_triangle_segments.append(segment_indices[owner])
+        triangles = np.asarray(visible_triangles, dtype=np.int64)
+        if not len(triangles):
+            continue
+        triangles = triangles.reshape((-1, 3))
+        triangle_segments = np.asarray(
+            visible_triangle_segments, dtype="<i4"
+        )
+        referenced = np.unique(triangles)
+        remap = np.full(len(renderable.mesh.vertices), -1, dtype=np.int64)
+        remap[referenced] = np.arange(len(referenced), dtype=np.int64)
+        local = np.empty((len(renderable.mesh.vertices), 3), dtype=np.float64)
+        renderable.mesh.vertices.foreach_get("co", local.ravel())
+        local = local[referenced]
+        homogeneous = np.concatenate(
+            (local, np.ones((len(local), 1), dtype=np.float64)), axis=1
+        )
+        for obj in renderable.objects:
+            if vertex_offset + len(referenced) > np.iinfo(np.int32).max:
+                raise RenderError("normalized render mesh exceeds the PLY index range")
+            matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+            if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+                raise RenderError("render occurrence has an invalid world transform")
+            determinant = float(np.linalg.det(matrix[:3, :3]))
+            if not math.isfinite(determinant) or abs(determinant) < 1.0e-15:
+                raise RenderError("render occurrence has a singular world transform")
+            world = homogeneous @ matrix.T
+            weights = world[:, 3:4]
+            if np.any(np.abs(weights) < 1.0e-14):
+                raise RenderError("render occurrence maps geometry to w=0")
+            normalized = (world[:, :3] / weights - center) / scale
+            if not np.isfinite(normalized).all():
+                raise RenderError("normalized render mesh contains non-finite vertices")
+            if np.any(normalized < -0.500001) or np.any(normalized > 0.500001):
+                raise RenderError("normalized render mesh exceeds its unit-cube bounds")
+            vertex_blocks.append(np.asarray(normalized, dtype="<f4"))
+            occurrence_triangles = remap[triangles] + vertex_offset
+            if determinant < 0.0:
+                occurrence_triangles = occurrence_triangles[:, (0, 2, 1)]
+            triangle_blocks.append(np.asarray(occurrence_triangles, dtype="<i4"))
+            triangle_segment_blocks.append(triangle_segments)
+            vertex_offset += len(referenced)
 
-    # Add dataset-specific args
-    dataset_utils.add_args(parser)
+    if not vertex_blocks or not triangle_blocks or not triangle_segment_blocks:
+        raise RenderError("asset has no visible triangles to export")
+    vertices = np.concatenate(vertex_blocks, axis=0)
+    triangles = np.concatenate(triangle_blocks, axis=0)
+    triangle_segments = np.concatenate(triangle_segment_blocks, axis=0)
 
-    opt = parser.parse_args(sys.argv[2:])
-    opt = edict(vars(opt))
-
-    os.makedirs(os.path.join(opt.output_dir, "renders"), exist_ok=True)
-
-    # Install blender
-    if not opt.quiet:
-        print("Checking blender...", flush=True)
-    _install_blender()
-
-    # Get file list from metadata
-    metadata_path = os.path.join(opt.output_dir, "metadata.csv")
-    if not os.path.exists(metadata_path):
-        raise ValueError(f"metadata.csv not found at {metadata_path}")
-
-    metadata = pd.read_csv(metadata_path)
-
-    if opt.instances is None:
-        metadata = metadata[metadata["local_path"].notna()]
-        if opt.filter_low_aesthetic_score is not None:
-            metadata = metadata[
-                metadata["aesthetic_score"] >= opt.filter_low_aesthetic_score
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment exact composed render geometry in normalized object coordinates\n"
+        f"comment segment_keys_sha256 {segment_keys_sha256}\n"
+        f"element vertex {len(vertices)}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        f"element face {len(triangles)}\n"
+        "property list uchar int vertex_indices\n"
+        "property int segment_index\n"
+        "end_header\n"
+    ).encode("ascii")
+    face_records = np.empty(
+        len(triangles),
+        dtype=np.dtype(
+            [
+                ("count", "u1"),
+                ("indices", "<i4", (3,)),
+                ("segment_index", "<i4"),
             ]
-        if "rendered" in metadata.columns:
-            metadata = metadata[metadata["rendered"] == False]
-    else:
-        if os.path.exists(opt.instances):
-            with open(opt.instances, "r") as f:
-                instances = f.read().splitlines()
-        else:
-            instances = opt.instances.split(",")
-        metadata = metadata[metadata["sha256"].isin(instances)]
+        ),
+    )
+    face_records["count"] = 3
+    face_records["indices"] = triangles
+    face_records["segment_index"] = triangle_segments
+    temporary = output_dir / ".mesh.ply.part"
+    with temporary.open("wb") as stream:
+        stream.write(header)
+        vertices.tofile(stream)
+        face_records.tofile(stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    destination = output_dir / "mesh.ply"
+    os.replace(temporary, destination)
+    record = {
+        "file_path": "mesh.ply",
+        "vertex_count": int(len(vertices)),
+        "triangle_count": int(len(triangles)),
+        "segment_keys": segment_keys,
+        "segment_keys_sha256": segment_keys_sha256,
+        "sha256": _sha256_file(destination),
+    }
+    _validate_normalized_mesh(destination, record)
+    return record
 
-    # Distributed processing slice
-    start = len(metadata) * opt.rank // opt.world_size
-    end = len(metadata) * (opt.rank + 1) // opt.world_size
-    metadata = metadata[start:end]
-    records = []
 
-    # Filter already processed
-    for sha256 in copy.copy(metadata["sha256"].values):
-        if os.path.exists(
-            os.path.join(opt.output_dir, "renders", sha256, "transforms.json")
+def _validate_normalized_mesh(path: Path, record: Mapping[str, Any]) -> None:
+    vertex_count = record.get("vertex_count")
+    triangle_count = record.get("triangle_count")
+    segment_keys = record.get("segment_keys")
+    if (
+        record.get("file_path") != "mesh.ply"
+        or type(vertex_count) is not int
+        or vertex_count < 3
+        or type(triangle_count) is not int
+        or triangle_count < 1
+        or not isinstance(segment_keys, list)
+        or not segment_keys
+        or len(set(segment_keys)) != len(segment_keys)
+        or not all(isinstance(key, str) and key for key in segment_keys)
+        or segment_keys != sorted(segment_keys)
+        or not isinstance(record.get("segment_keys_sha256"), str)
+        or len(record["segment_keys_sha256"]) != 64
+        or not isinstance(record.get("sha256"), str)
+        or len(record["sha256"]) != 64
+    ):
+        raise RenderError("normalized mesh manifest is invalid")
+    with path.open("rb") as stream:
+        header = stream.read(65536)
+    marker = b"end_header\n"
+    marker_offset = header.find(marker)
+    if marker_offset < 0:
+        raise RenderError("normalized mesh has no complete PLY header")
+    header_size = marker_offset + len(marker)
+    segment_keys_sha256 = hashlib.sha256(
+        json.dumps(
+            segment_keys, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if record["segment_keys_sha256"] != segment_keys_sha256:
+        raise RenderError("normalized mesh segment-key hash is invalid")
+    expected_header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        "comment exact composed render geometry in normalized object coordinates\n"
+        f"comment segment_keys_sha256 {segment_keys_sha256}\n"
+        f"element vertex {vertex_count}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        f"element face {triangle_count}\n"
+        "property list uchar int vertex_indices\n"
+        "property int segment_index\n"
+        "end_header\n"
+    ).encode("ascii")
+    if header[:header_size] != expected_header:
+        raise RenderError("normalized mesh PLY header does not match its manifest")
+    expected_size = header_size + vertex_count * 12 + triangle_count * 17
+    if path.stat().st_size != expected_size:
+        raise RenderError("normalized mesh PLY payload has an invalid size")
+    vertices = np.memmap(
+        path,
+        mode="r",
+        dtype="<f4",
+        offset=header_size,
+        shape=(vertex_count, 3),
+    )
+    face_dtype = np.dtype(
+        [
+            ("count", "u1"),
+            ("indices", "<i4", (3,)),
+            ("segment_index", "<i4"),
+        ]
+    )
+    faces = np.memmap(
+        path,
+        mode="r",
+        dtype=face_dtype,
+        offset=header_size + vertex_count * 12,
+        shape=(triangle_count,),
+    )
+    if (
+        not np.isfinite(vertices).all()
+        or np.any(vertices < -0.500001)
+        or np.any(vertices > 0.500001)
+        or np.any(faces["count"] != 3)
+        or int(faces["indices"].min()) < 0
+        or int(faces["indices"].max()) >= vertex_count
+        or int(faces["segment_index"].min()) < 0
+        or int(faces["segment_index"].max()) >= len(segment_keys)
+        or not np.array_equal(
+            np.unique(faces["segment_index"]),
+            np.arange(len(segment_keys), dtype=np.int32),
+        )
+    ):
+        raise RenderError("normalized mesh PLY payload is invalid")
+    del faces
+    del vertices
+    if _sha256_file(path) != record["sha256"]:
+        raise RenderError("normalized mesh PLY hash does not match its manifest")
+
+
+def _transparent_png_statistics(path: Path, size: int) -> dict[str, Any]:
+    with Image.open(path) as image:
+        image.load()
+        if image.format != "PNG" or image.mode != "RGBA" or image.size != (size, size):
+            raise RenderError(
+                f"invalid render {path}: {image.format}, {image.mode}, {image.size}"
+            )
+        rgba = np.asarray(image, dtype=np.uint8)
+    alpha = rgba[:, :, 3]
+    foreground = alpha > 0
+    foreground_count = int(foreground.sum())
+    border = np.concatenate(
+        (alpha[0], alpha[-1], alpha[1:-1, 0], alpha[1:-1, -1])
+    )
+    if int(border.max()) != 0:
+        raise RenderError(f"rendered geometry touches the image border: {path}")
+    if foreground_count == 0:
+        return {
+            "foreground_pixels": 0,
+            "alpha_bbox": None,
+            "mean_foreground_rgb": None,
+        }
+    ys, xs = np.nonzero(foreground)
+    foreground_rgb = rgba[:, :, :3][foreground]
+    return {
+        "foreground_pixels": foreground_count,
+        "alpha_bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
+        "mean_foreground_rgb": [
+            float(value) for value in foreground_rgb.mean(axis=0) / 255.0
+        ],
+    }
+
+
+def _geometric_alpha_material(
+    bpy: Any,
+    plan: Any,
+    image_cache: dict[tuple[str, str, str], Any],
+    uv_aliases: Mapping[str, str],
+) -> Any:
+    material = bpy.data.materials.new(
+        f"multiview_geometric_alpha_{plan.provenance_sha256[:12]}"
+    )
+    material.use_nodes = True
+    material.use_backface_culling = not plan.double_sided
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+
+    sockets = textured._texture_socket_map(
+        bpy,
+        nodes,
+        links,
+        plan,
+        image_cache,
+        None,
+        uv_aliases,
+        False,
+    )
+    opacity: Any
+    if "opacity" in sockets:
+        opacity = sockets["opacity"][1]
+        if (
+            plan.material_model == "principled"
+            and not plan.omnipbr_controls
+            and plan.opacity != 1.0
         ):
-            records.append({"sha256": sha256, "rendered": True})
-            metadata = metadata[metadata["sha256"] != sha256]
+            opacity = textured._math_node(
+                nodes, "MULTIPLY", opacity, plan.opacity
+            )
+        threshold = max(plan.opacity_threshold, 1.0e-6)
+        opacity = textured._math_node(
+            nodes,
+            "SUBTRACT",
+            1.0,
+            textured._math_node(nodes, "LESS_THAN", opacity, threshold),
+        )
+    elif plan.material_model == "principled" and plan.display_opacity_attribute:
+        attribute = nodes.new("ShaderNodeAttribute")
+        attribute.attribute_name = plan.display_opacity_attribute
+        threshold = max(plan.opacity_threshold, 1.0e-6)
+        opacity = textured._math_node(
+            nodes,
+            "SUBTRACT",
+            1.0,
+            textured._math_node(
+                nodes, "LESS_THAN", attribute.outputs["Fac"], threshold
+            ),
+        )
+    else:
+        if plan.opacity_threshold > 0.0:
+            opacity = float(plan.opacity >= plan.opacity_threshold)
+        else:
+            opacity = float(plan.opacity > 0.0)
 
-    print(f"Processing {len(metadata)} objects (rank {opt.rank}/{opt.world_size})...")
+    surface = textured._opacity_shader(
+        nodes, links, emission.outputs["Emission"], opacity, 0.0
+    )
+    surface = textured._one_sided_shader(
+        nodes, links, surface, plan.double_sided
+    )
+    links.new(surface, output.inputs["Surface"])
+    return material
 
-    # Process objects
-    from concurrent.futures import ThreadPoolExecutor
-    from tqdm import tqdm
 
-    results = []
-    with ThreadPoolExecutor(max_workers=opt.max_workers) as executor:
-        futures = []
-        for _, row in metadata.iterrows():
-            sha256 = row["sha256"]
-            local_path = row["local_path"]
-            dataset = row.get("dataset", "unknown")
-
-            futures.append(
-                executor.submit(
-                    _render_worker,
-                    local_path,
-                    sha256,
-                    dataset,
-                    opt.output_dir,
-                    opt.num_views,
-                    opt.quiet,
+def _geometric_alpha_segments(
+    segments: Mapping[str, Any], plans: Mapping[str, Any]
+) -> set[str]:
+    result = set()
+    for key, plan in plans.items():
+        if not textured._render_content(segments[key]):
+            continue
+        has_opacity_texture = any(
+            texture.role == "opacity" for texture in plan.textures
+        )
+        has_dynamic_opacity = has_opacity_texture or bool(
+            plan.display_opacity_attribute
+        )
+        has_visible_opacity = has_dynamic_opacity or plan.opacity > 0.0
+        has_transmission_texture = any(
+            texture.role == "transmission_weight" for texture in plan.textures
+        )
+        has_dynamic_transmission = (
+            plan.material_model == "omnisurface"
+            and bool(plan.model_parameters.get("transmission_enabled"))
+            and has_transmission_texture
+        )
+        if (
+            (
+                has_visible_opacity
+                and (
+                    plan.material_model == "omniglass"
+                    or plan.transmission_weight > 0.0
+                    or has_dynamic_transmission
                 )
             )
+            or (
+                0.0 < plan.opacity < 1.0
+                and plan.opacity_threshold == 0.0
+                and not has_opacity_texture
+                and not plan.display_opacity_attribute
+            )
+        ):
+            result.add(key)
+    return result
 
-        for future in tqdm(futures, desc="Rendering", disable=opt.quiet):
-            try:
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-            except Exception as e:
-                if not opt.quiet:
-                    print(f"Error in worker: {e}")
 
-    # Save results
-    rendered = pd.concat(
-        [pd.DataFrame.from_records(results), pd.DataFrame.from_records(records)]
+def _prepare_geometric_alpha_states(
+    renderables: list[Any], segment_keys: set[str], materials: Mapping[str, Any]
+) -> list[tuple[Any, tuple[int, ...], bool]]:
+    states = []
+    for renderable in renderables:
+        mask_indices_by_segment = {}
+        for key in sorted(renderable.segment_keys & segment_keys):
+            mask_indices_by_segment[key] = len(renderable.mesh.materials)
+            renderable.mesh.materials.append(materials[key])
+        mask_indices = tuple(
+            mask_indices_by_segment.get(owner, renderable.transparent_index)
+            for owner in renderable.face_segments
+        )
+        visible = any(owner in segment_keys for owner in renderable.face_segments)
+        states.append((renderable, mask_indices, visible))
+    return states
+
+
+def _set_whole_render_state(
+    renderables: list[Any], segments: Mapping[str, Any]
+) -> None:
+    for renderable in renderables:
+        if any(textured._render_content(segments[key]) for key in renderable.segment_keys):
+            renderable.whole_state()
+        else:
+            for obj in renderable.objects:
+                obj.hide_render = True
+
+
+def _render_geometric_alpha(
+    bpy: Any,
+    scene: Any,
+    states: list[tuple[Any, tuple[int, ...], bool]],
+    destination: Path,
+) -> None:
+    for renderable, indices, visible in states:
+        for polygon, material_index in zip(renderable.mesh.polygons, indices):
+            polygon.material_index = material_index
+        for obj in renderable.objects:
+            obj.hide_render = not visible
+    bpy.context.view_layer.update()
+    previous_samples = scene.cycles.samples
+    previous_denoising = scene.cycles.use_denoising
+    previous_transparent_bounces = scene.cycles.transparent_max_bounces
+    try:
+        scene.cycles.samples = ALPHA_MASK_SAMPLES
+        scene.cycles.use_denoising = False
+        scene.cycles.transparent_max_bounces = 64
+        scene.render.filepath = str(destination)
+        result = bpy.ops.render.render(scene=scene.name, write_still=True)
+        if result != {"FINISHED"}:
+            raise RenderError(f"geometric-alpha render did not finish: {result!r}")
+    finally:
+        scene.cycles.samples = previous_samples
+        scene.cycles.use_denoising = previous_denoising
+        scene.cycles.transparent_max_bounces = previous_transparent_bounces
+
+
+def _render_transmissive_backdrop(
+    bpy: Any,
+    scene: Any,
+    renderables: list[Any],
+    segments: Mapping[str, Any],
+    destination: Path,
+) -> None:
+    _set_whole_render_state(renderables, segments)
+    bpy.context.view_layer.update()
+    previous_transparency = scene.render.film_transparent
+    try:
+        scene.render.film_transparent = False
+        scene.render.filepath = str(destination)
+        result = bpy.ops.render.render(scene=scene.name, write_still=True)
+        if result != {"FINISHED"}:
+            raise RenderError(f"transmissive-backdrop render did not finish: {result!r}")
+    finally:
+        scene.render.film_transparent = previous_transparency
+
+
+def _apply_geometric_alpha(
+    beauty_path: Path,
+    backdrop_path: Path,
+    mask_path: Path,
+    size: int,
+) -> None:
+    with Image.open(beauty_path) as image:
+        image.load()
+        beauty = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    with Image.open(backdrop_path) as image:
+        image.load()
+        backdrop = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    with Image.open(mask_path) as image:
+        image.load()
+        mask = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    if (
+        beauty.shape != (size, size, 4)
+        or backdrop.shape != beauty.shape
+        or mask.shape != beauty.shape
+    ):
+        raise RenderError("beauty, backdrop, and geometric-alpha renders do not align")
+    # Keep glass in the foreground mask even when its render alpha is low.
+    selected = mask[:, :, 3] > beauty[:, :, 3]
+    beauty[:, :, :3][selected] = backdrop[:, :, :3][selected]
+    beauty[:, :, 3] = np.maximum(beauty[:, :, 3], mask[:, :, 3])
+    combined = beauty_path.with_name(beauty_path.stem + ".combined.png")
+    Image.fromarray(beauty, "RGBA").save(combined, format="PNG", compress_level=3)
+    os.replace(combined, beauty_path)
+    backdrop_path.unlink()
+    mask_path.unlink()
+
+
+def _configure_multiview_scene(bpy: Any, scene: Any) -> dict[str, Any]:
+    runtime = textured._configure_cycles_gpu(bpy, scene)
+    scene.render.film_transparent = True
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "8"
+    scene.render.image_settings.compression = 15
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "None"
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    scene.cycles.samples = CYCLES_SAMPLES
+    scene.cycles.use_adaptive_sampling = False
+    scene.cycles.use_denoising = True
+    scene.cycles.pixel_filter_type = "BOX"
+    scene.cycles.filter_width = 1.0
+    scene.cycles.diffuse_bounces = 1
+    scene.cycles.glossy_bounces = 1
+    scene.cycles.transparent_max_bounces = 3
+    scene.cycles.transmission_bounces = 3
+    scene.render.use_persistent_data = True
+
+    background = scene.world.node_tree.nodes.get("Background")
+    background.inputs["Color"].default_value = (*WORLD_COLOR, 1.0)
+    background.inputs["Strength"].default_value = WORLD_STRENGTH
+    runtime["cycles_samples"] = CYCLES_SAMPLES
+    return runtime
+
+
+def _create_camera_and_lights(
+    bpy: Any,
+    collection: Any,
+    center: np.ndarray,
+    raw_scale: float,
+):
+    camera_data = bpy.data.cameras.new("multiview_camera")
+    camera_data.type = "PERSP"
+    camera_data.sensor_width = CAMERA_SENSOR_SIZE_MM
+    camera_data.sensor_height = CAMERA_SENSOR_SIZE_MM
+    camera_data.lens = 0.5 * CAMERA_SENSOR_SIZE_MM / math.tan(CAMERA_FOV * 0.5)
+    camera = bpy.data.objects.new("multiview_camera", camera_data)
+    collection.objects.link(camera)
+
+    lights = []
+    axes = (
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 0.0, -1.0),
     )
-    rendered.to_csv(
-        os.path.join(opt.output_dir, f"rendered_{opt.rank}.csv"), index=False
+    for index, axis in enumerate(axes):
+        light_data = bpy.data.lights.new(f"uniform_area_{index}", "AREA")
+        light_data.shape = "DISK"
+        light_data.energy = AREA_LIGHT_STRENGTH * raw_scale * raw_scale
+        light_data.size = AREA_LIGHT_SIZE * raw_scale
+        light_data.use_shadow = False
+        light = bpy.data.objects.new(f"uniform_area_{index}", light_data)
+        collection.objects.link(light)
+        location = center + np.asarray(axis, dtype=np.float64) * raw_scale * 3.0
+        light.location = tuple(float(value) for value in location)
+        light.rotation_euler = Vector(tuple(center - location)).to_track_quat("-Z", "Y").to_euler()
+        lights.append(light)
+    return camera, lights
+
+
+def _render_asset_in_process(
+    source: Path,
+    dataset: str,
+    asset_id: str,
+    output_dir: Path,
+    num_views: int,
+    size: int,
+) -> None:
+    extraction = _extract_asset(source, dataset)
+    geometry_payloads = build_asset_geometry_payloads(source, extraction)
+    segments, materials, payload_hashes = textured._validate_payloads(
+        extraction, geometry_payloads
+    )
+    subdivision_level = textured._asset_catmull_subdivision_level(geometry_payloads)
+    up_axes = {
+        str(payload.provenance.get("stage_up_axis") or "").upper()
+        for payload in geometry_payloads.values()
+    }
+    if len(up_axes) != 1 or not up_axes <= {"Y", "Z"}:
+        raise RenderError(f"inconsistent stage up axes: {sorted(up_axes)!r}")
+    up_axis = next(iter(up_axes))
+    plans = {
+        key: textured._build_material_plan(segments[key], payload, materials)
+        for key, payload in geometry_payloads.items()
+    }
+    uv_aliases = {key: textured._uv_aliases(plan) for key, plan in plans.items()}
+    center, raw_scale, normalized_points = _visible_bounds(
+        segments, geometry_payloads
     )
 
-    print(f"Done! Rendered {len(results)} objects.")
+    if tuple(bpy.app.version[:2]) != (4, 2):
+        raise RenderError(f"expected bpy 4.2.x, found {tuple(bpy.app.version)}")
 
-
-def main_single():
-    parser = argparse.ArgumentParser(
-        description="Render a single USD file with proper texture extraction"
-    )
-    parser.add_argument("usd_file", help="Path to USD file")
-    parser.add_argument(
-        "--output_dir",
-        "-o",
-        default=None,
-        help="Output directory (default: /tmp/render_<filename>)",
-    )
-    parser.add_argument(
-        "--num_views", type=int, default=150, help="Number of views to render"
-    )
-    parser.add_argument("--resolution", type=int, default=512, help="Image resolution")
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Print detailed logs"
-    )
-    parser.add_argument(
-        "--extract_only",
-        action="store_true",
-        help="Only extract materials (don't render)",
-    )
-
-    args = parser.parse_args()
-
-    if not os.path.exists(args.usd_file):
-        print(f"ERROR: USD file not found: {args.usd_file}")
-        sys.exit(1)
-
-    if args.extract_only:
-        extractor = USDMaterialExtractor(args.usd_file, verbose=True)
-        extractor.extract()
-
-        print("\n=== SUMMARY ===")
-        print(f"Meshes: {len(extractor.meshes)}")
-        print(f"Materials: {len(extractor.materials)}")
-
-        total_textures = sum(len(t) for t in extractor.materials.values())
-        print(f"Total textures: {total_textures}")
-
-        for mat_path, textures in extractor.materials.items():
-            if textures:
-                mat_name = mat_path.split("/")[-1] if mat_path else "unknown"
-                print(f"\n{mat_name}:")
-                for tex_type, tex_path in textures.items():
-                    print(f"  {tex_type}: {os.path.basename(tex_path)}")
-    else:
-        _install_blender()
-
-        output_dir = args.output_dir
-        if not output_dir:
-            filename = Path(args.usd_file).stem
-            output_dir = f"/tmp/render_{filename}"
-
-        success = render_usd(
-            args.usd_file,
+    before = textured._snapshot_data_names(bpy)
+    previous_scene = bpy.context.window.scene if bpy.context.window else None
+    try:
+        scene, collection = textured._new_scene(bpy, size)
+        if bpy.context.window:
+            bpy.context.window.scene = scene
+        runtime = _configure_multiview_scene(bpy, scene)
+        image_cache: dict[tuple[str, str, str], Any] = {}
+        blender_materials = {
+            key: textured._build_blender_material(
+                bpy, plan, image_cache, uv_aliases=uv_aliases[key]
+            )
+            for key, plan in plans.items()
+        }
+        transparent = textured._transparent_material(bpy)
+        renderables = textured._build_asset_renderables(
+            bpy,
+            Matrix,
+            collection,
+            segments,
+            geometry_payloads,
+            plans,
+            blender_materials,
+            transparent,
+            uv_aliases,
+            subdivision_level,
+        )
+        mesh_record = _write_normalized_mesh(
             output_dir,
-            num_views=args.num_views,
-            resolution=args.resolution,
-            verbose=args.verbose,
+            renderables,
+            segments,
+            center,
+            raw_scale,
+        )
+        _set_whole_render_state(renderables, segments)
+        geometric_alpha_segments = _geometric_alpha_segments(segments, plans)
+        geometric_alpha_materials = {
+            key: _geometric_alpha_material(
+                bpy,
+                plans[key],
+                image_cache,
+                uv_aliases[key],
+            )
+            for key in geometric_alpha_segments
+        }
+        geometric_alpha_states = (
+            _prepare_geometric_alpha_states(
+                renderables,
+                geometric_alpha_segments,
+                geometric_alpha_materials,
+            )
+            if geometric_alpha_segments
+            else []
         )
 
-        if success:
-            print(f"\n✓ Rendered to: {output_dir}")
-        else:
-            print(f"\n✗ Rendering failed")
-            sys.exit(1)
+        camera, _ = _create_camera_and_lights(bpy, collection, center, raw_scale)
+        scene.camera = camera
+        camera.data.clip_start = max(raw_scale * 1.0e-4, 1.0e-6)
+        camera.data.clip_end = max(raw_scale * 8.0, camera.data.clip_start * 1000.0)
+
+        frames = []
+        frame_statistics = []
+        for index, yaw, pitch, direction in _camera_samples(
+            asset_id, num_views, up_axis
+        ):
+            horizontal, vertical = _camera_frame(direction, up_axis)
+            radius = _camera_radius(
+                normalized_points, direction, horizontal, vertical
+            )
+            raw_location = center + direction * radius * raw_scale
+            camera.matrix_world = Matrix(
+                (
+                    (horizontal[0], vertical[0], direction[0], raw_location[0]),
+                    (horizontal[1], vertical[1], direction[1], raw_location[1]),
+                    (horizontal[2], vertical[2], direction[2], raw_location[2]),
+                    (0.0, 0.0, 0.0, 1.0),
+                )
+            )
+            bpy.context.view_layer.update()
+
+            filename = f"{index:03d}.png"
+            destination = output_dir / filename
+            temporary = output_dir / f".{index:03d}.part.png"
+            scene.render.filepath = str(temporary)
+            result = bpy.ops.render.render(scene=scene.name, write_still=True)
+            if result != {"FINISHED"}:
+                raise RenderError(f"Cycles did not finish view {index}: {result!r}")
+            if geometric_alpha_states:
+                backdrop_temporary = output_dir / f".{index:03d}.backdrop.part.png"
+                alpha_temporary = output_dir / f".{index:03d}.alpha.part.png"
+                try:
+                    _render_transmissive_backdrop(
+                        bpy,
+                        scene,
+                        renderables,
+                        segments,
+                        backdrop_temporary,
+                    )
+                    _render_geometric_alpha(
+                        bpy,
+                        scene,
+                        geometric_alpha_states,
+                        alpha_temporary,
+                    )
+                    _apply_geometric_alpha(
+                        temporary,
+                        backdrop_temporary,
+                        alpha_temporary,
+                        size,
+                    )
+                finally:
+                    _set_whole_render_state(renderables, segments)
+                    bpy.context.view_layer.update()
+                    backdrop_temporary.unlink(missing_ok=True)
+                    alpha_temporary.unlink(missing_ok=True)
+            statistics = _transparent_png_statistics(temporary, size)
+            os.replace(temporary, destination)
+            frame_statistics.append(statistics)
+
+            normalized_location = (raw_location - center) / raw_scale
+            normalized_c2w = [
+                [
+                    float(horizontal[0]),
+                    float(vertical[0]),
+                    float(direction[0]),
+                    float(normalized_location[0]),
+                ],
+                [
+                    float(horizontal[1]),
+                    float(vertical[1]),
+                    float(direction[1]),
+                    float(normalized_location[1]),
+                ],
+                [
+                    float(horizontal[2]),
+                    float(vertical[2]),
+                    float(direction[2]),
+                    float(normalized_location[2]),
+                ],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+            frames.append(
+                {
+                    "file_path": filename,
+                    "camera_angle_x": CAMERA_FOV,
+                    "transform_matrix": normalized_c2w,
+                    "yaw": yaw,
+                    "pitch": pitch,
+                    "radius": radius,
+                }
+            )
+
+        input_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "entrypoint": _sha256_file(source),
+                    "geometry": payload_hashes,
+                    "materials": {
+                        key: plans[key].provenance_sha256 for key in sorted(plans)
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        input_files = _input_file_records(source, geometry_payloads, plans)
+        visible_statistics = [
+            record
+            for record in frame_statistics
+            if record["mean_foreground_rgb"] is not None
+        ]
+        if not visible_statistics:
+            raise RenderError("asset is transparent from every sampled viewpoint")
+        focal = 0.5 / math.tan(CAMERA_FOV * 0.5)
+        manifest = {
+            "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            "scale": 1.0 / raw_scale,
+            "offset": [float(value) for value in -center / raw_scale],
+            "normalization": {
+                "source_center": [float(value) for value in center],
+                "source_scale": raw_scale,
+            },
+            "mesh": mesh_record,
+            "camera_intrinsics": {
+                "normalized": [
+                    [focal, 0.0, 0.5],
+                    [0.0, focal, 0.5],
+                    [0.0, 0.0, 1.0],
+                ],
+                "pixels": [
+                    [focal * size, 0.0, size * 0.5],
+                    [0.0, focal * size, size * 0.5],
+                    [0.0, 0.0, 1.0],
+                ],
+            },
+            "render_settings": {
+                "resolution": size,
+                "num_views": num_views,
+                "engine": "CYCLES",
+                "blender_version": list(bpy.app.version),
+                "gpu_backend": runtime["render_backend"],
+                "gpu_device": list(runtime["render_device"]),
+                "cycles_samples": CYCLES_SAMPLES,
+                "adaptive_sampling": False,
+                "denoising": True,
+                "pixel_filter_type": "BOX",
+                "pixel_filter_width": 1.0,
+                "diffuse_bounces": 1,
+                "glossy_bounces": 1,
+                "transparent_bounces": 3,
+                "transmission_bounces": 3,
+                "camera_fov_degrees": 40.0,
+                "camera_nominal_radius": CAMERA_NOMINAL_RADIUS,
+                "camera_fit_fraction": CAMERA_FRAME_FRACTION,
+                "transparent_background": True,
+                "alpha_mask_samples": ALPHA_MASK_SAMPLES,
+                "geometric_alpha_segment_count": len(geometric_alpha_segments),
+                "color_transform": "Filmic",
+                "world_color": list(WORLD_COLOR),
+                "world_strength": WORLD_STRENGTH,
+                "area_light_count": 6,
+                "area_light_strength": AREA_LIGHT_STRENGTH,
+                "area_light_size": AREA_LIGHT_SIZE,
+                "light_shadows": False,
+            },
+            "source_entrypoint": str(source),
+            "source_entrypoint_sha256": _sha256_file(source),
+            "input_fingerprint": input_fingerprint,
+            "input_files": input_files,
+            "stage_up_axis": up_axis,
+            "foreground_rgb_range": {
+                "minimum_mean": [
+                    min(record["mean_foreground_rgb"][channel] for record in visible_statistics)
+                    for channel in range(3)
+                ],
+                "maximum_mean": [
+                    max(record["mean_foreground_rgb"][channel] for record in visible_statistics)
+                    for channel in range(3)
+                ],
+            },
+            "empty_frame_count": len(frame_statistics) - len(visible_statistics),
+            "frames": frames,
+        }
+        temporary_manifest = output_dir / ".transforms.json.part"
+        with temporary_manifest.open("w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_manifest, output_dir / "transforms.json")
+    finally:
+        if bpy.context.window and previous_scene is not None:
+            bpy.context.window.scene = previous_scene
+        textured._cleanup_new_data(bpy, before)
+
+
+def _validate_complete_render(
+    output_dir: Path, num_views: int, size: int, *, decode: bool
+) -> dict[str, Any]:
+    manifest_path = output_dir / "transforms.json"
+    with manifest_path.open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    settings = manifest.get("render_settings")
+    frames = manifest.get("frames")
+    mesh_record = manifest.get("mesh")
+    if (
+        not isinstance(settings, dict)
+        or settings.get("resolution") != size
+        or settings.get("num_views") != num_views
+        or settings.get("engine") != "CYCLES"
+        or settings.get("cycles_samples") != CYCLES_SAMPLES
+        or settings.get("adaptive_sampling") is not False
+        or settings.get("denoising") is not True
+        or settings.get("pixel_filter_type") != "BOX"
+        or settings.get("pixel_filter_width") != 1.0
+        or settings.get("diffuse_bounces") != 1
+        or settings.get("glossy_bounces") != 1
+        or settings.get("transparent_bounces") != 3
+        or settings.get("transmission_bounces") != 3
+        or settings.get("camera_fov_degrees") != 40.0
+        or settings.get("camera_nominal_radius") != CAMERA_NOMINAL_RADIUS
+        or settings.get("camera_fit_fraction") != CAMERA_FRAME_FRACTION
+        or settings.get("transparent_background") is not True
+        or settings.get("alpha_mask_samples") != ALPHA_MASK_SAMPLES
+        or settings.get("color_transform") != "Filmic"
+        or settings.get("world_color") != list(WORLD_COLOR)
+        or settings.get("world_strength") != WORLD_STRENGTH
+        or settings.get("area_light_count") != 6
+        or settings.get("area_light_strength") != AREA_LIGHT_STRENGTH
+        or settings.get("area_light_size") != AREA_LIGHT_SIZE
+        or settings.get("light_shadows") is not False
+        or not isinstance(mesh_record, dict)
+        or not isinstance(frames, list)
+        or len(frames) != num_views
+    ):
+        raise RenderError("render manifest does not match the active renderer")
+
+    normalization = manifest.get("normalization")
+    if not isinstance(normalization, dict):
+        raise RenderError("render manifest has no normalization parameters")
+    center = np.asarray(normalization.get("source_center"), dtype=np.float64)
+    source_scale = float(normalization.get("source_scale"))
+    offset = np.asarray(manifest.get("offset"), dtype=np.float64)
+    scale = float(manifest.get("scale"))
+    if (
+        manifest.get("aabb") != [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]
+        or center.shape != (3,)
+        or offset.shape != (3,)
+        or not np.isfinite(center).all()
+        or not np.isfinite(offset).all()
+        or not math.isfinite(source_scale)
+        or source_scale <= 0.0
+        or not math.isfinite(scale)
+        or not math.isclose(scale, 1.0 / source_scale, rel_tol=0.0, abs_tol=1.0e-12)
+        or not np.allclose(
+            offset,
+            -center / source_scale,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+    ):
+        raise RenderError("render manifest normalization values are inconsistent")
+    _validate_normalized_mesh(output_dir / "mesh.ply", mesh_record)
+
+    expected_paths = [f"{index:03d}.png" for index in range(num_views)]
+    if [frame.get("file_path") for frame in frames] != expected_paths:
+        raise RenderError("render manifest has missing or reordered frame paths")
+    for frame, relative_path in zip(frames, expected_paths):
+        matrix = np.asarray(frame.get("transform_matrix"), dtype=np.float64)
+        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+            raise RenderError(f"invalid camera matrix for {relative_path}")
+        if not math.isclose(
+            float(frame.get("camera_angle_x")), CAMERA_FOV, rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            raise RenderError(f"invalid camera FOV for {relative_path}")
+        image_path = output_dir / relative_path
+        if not image_path.is_file() or image_path.stat().st_size < 128:
+            raise RenderError(f"missing rendered frame {image_path}")
+        with Image.open(image_path) as image:
+            if image.format != "PNG" or image.mode != "RGBA" or image.size != (size, size):
+                raise RenderError(f"invalid PNG frame {image_path}")
+            if decode:
+                image.load()
+            else:
+                image.verify()
+    return manifest
+
+
+def _publish_render(staging: Path, destination: Path, num_views: int) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    completion_marker = destination / "transforms.json"
+    if completion_marker.exists():
+        completion_marker.unlink()
+    os.replace(staging / "mesh.ply", destination / "mesh.ply")
+    for index in range(num_views):
+        filename = f"{index:03d}.png"
+        os.replace(staging / filename, destination / filename)
+    os.replace(staging / "transforms.json", completion_marker)
+    directory = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _render_one(
+    row: Mapping[str, Any],
+    output_root: Path,
+    num_views: int,
+    size: int,
+    force: bool,
+    quiet: bool,
+) -> dict[str, Any]:
+    asset_id = str(row["sha256"])
+    dataset = str(row.get("dataset") or "simready")
+    source = Path(str(row["local_path"])).expanduser().resolve()
+    if not source.is_file():
+        raise RenderError(f"source asset is missing: {source}")
+    key = _asset_key(source, dataset)
+    if key is not None and asset_annotation_exclusion(key) is not None:
+        return {"sha256": asset_id, "rendered": False, "dataset": dataset, "skipped": True}
+
+    destination = output_root / "renders" / asset_id
+    if not force and (destination / "transforms.json").is_file():
+        try:
+            manifest = _validate_complete_render(
+                destination, num_views, size, decode=False
+            )
+            if (
+                manifest.get("source_entrypoint_sha256") == _sha256_file(source)
+                and _manifest_inputs_are_current(manifest)
+            ):
+                return {"sha256": asset_id, "rendered": True, "dataset": dataset}
+        except (AttributeError, OSError, TypeError, ValueError, RenderError):
+            pass
+
+    staging_parent = output_root / "renders"
+    staging = Path(tempfile.mkdtemp(prefix=f".{asset_id}.render.", dir=staging_parent))
+    try:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--worker",
+            "--source",
+            str(source),
+            "--dataset",
+            dataset,
+            "--asset-id",
+            asset_id,
+            "--worker-output",
+            str(staging),
+            "--num_views",
+            str(num_views),
+            "--resolution",
+            str(size),
+        ]
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE if quiet else None,
+            stderr=subprocess.STDOUT if quiet else None,
+        )
+        if completed.returncode:
+            detail = (completed.stdout or "")[-12000:].strip()
+            raise RenderError(
+                f"renderer process exited {completed.returncode} for {source}"
+                + (f"\n{detail}" if detail else "")
+            )
+        _validate_complete_render(staging, num_views, size, decode=True)
+        _publish_render(staging, destination, num_views)
+        _validate_complete_render(destination, num_views, size, decode=False)
+        return {"sha256": asset_id, "rendered": True, "dataset": dataset}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _run_batch(arguments: argparse.Namespace) -> int:
+    if arguments.dataset_type not in {
+        "allmats",
+        "simready",
+        "commercial",
+        "residential",
+        "vegetation",
+    }:
+        raise RenderError(f"unknown dataset type {arguments.dataset_type!r}")
+    if arguments.num_views <= 0 or arguments.resolution != RESOLUTION:
+        raise RenderError("num_views must be positive and resolution must be 512")
+    if arguments.max_workers != 1:
+        raise RenderError("exact Cycles rendering requires max_workers=1 per GPU shard")
+    if not 0 <= arguments.rank < arguments.world_size:
+        raise RenderError("rank must be in [0, world_size)")
+
+    output_root = Path(arguments.output_dir).expanduser().resolve()
+    (output_root / "renders").mkdir(parents=True, exist_ok=True)
+    included = (
+        "simready,commercial,residential,vegetation"
+        if arguments.dataset_type == "allmats"
+        else arguments.dataset_type
+    )
+    metadata = get_asset_inventory(
+        output_dir=None,
+        include_datasets=included,
+        skip_split=True,
+    )
+    if arguments.instances:
+        instance_path = Path(arguments.instances)
+        instances = (
+            instance_path.read_text(encoding="utf-8").splitlines()
+            if instance_path.is_file()
+            else arguments.instances.split(",")
+        )
+        metadata = metadata[metadata["sha256"].astype(str).isin(instances)]
+
+    metadata = metadata.sort_values("sha256", kind="stable").reset_index(drop=True)
+    metadata = metadata.iloc[arguments.rank :: arguments.world_size]
+    rows = metadata.to_dict("records")
+    records = []
+    failures = []
+    for row in tqdm(rows, desc=f"Rendering shard {arguments.rank}"):
+        try:
+            record = _render_one(
+                row,
+                output_root,
+                arguments.num_views,
+                arguments.resolution,
+                arguments.force,
+                arguments.quiet,
+            )
+        except Exception as exc:
+            record = {
+                "sha256": str(row["sha256"]),
+                "rendered": False,
+                "dataset": str(row.get("dataset") or "simready"),
+            }
+            failures.append((row, exc))
+            tqdm.write(
+                f"FAILED {row['sha256']} {row['local_path']}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        records.append(record)
+
+    records.sort(key=lambda record: record["sha256"])
+    result_path = output_root / f"rendered_{arguments.rank}.csv"
+    pd.DataFrame.from_records(records).to_csv(result_path, index=False)
+    succeeded = sum(record["rendered"] is True for record in records)
+    skipped = sum(record.get("skipped") is True for record in records)
+    print(
+        f"Shard {arguments.rank}: {succeeded} complete, {skipped} intentionally skipped, "
+        f"{len(failures)} failed; results: {result_path}"
+    )
+    return 1 if failures else 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Render all material USD assets with exact textures and cameras."
+    )
+    parser.add_argument("dataset_type", nargs="?")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--num_views", type=int, default=DEFAULT_NUM_VIEWS)
+    parser.add_argument("--resolution", type=int, default=RESOLUTION)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--max_workers", type=int, default=1)
+    parser.add_argument("--instances")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--source", help=argparse.SUPPRESS)
+    parser.add_argument("--dataset", help=argparse.SUPPRESS)
+    parser.add_argument("--asset-id", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-output", help=argparse.SUPPRESS)
+    return parser
+
+
+def main() -> int:
+    arguments = _parser().parse_args()
+    if arguments.worker:
+        if not all(
+            (arguments.source, arguments.dataset, arguments.asset_id, arguments.worker_output)
+        ):
+            raise RenderError("worker arguments are incomplete")
+        _render_asset_in_process(
+            Path(arguments.source).resolve(),
+            arguments.dataset,
+            arguments.asset_id,
+            Path(arguments.worker_output).resolve(),
+            arguments.num_views,
+            arguments.resolution,
+        )
+        return 0
+    if not arguments.dataset_type or not arguments.output_dir:
+        raise RenderError("dataset_type and --output_dir are required")
+    return _run_batch(arguments)
 
 
 if __name__ == "__main__":
-    # Check if first arg is a dataset type (batch mode) or a file (single mode)
-    if (
-        len(sys.argv) > 1
-        and not sys.argv[1].startswith("-")
-        and not os.path.exists(sys.argv[1])
-    ):
-        # Batch mode: first arg is dataset type like "allmats"
-        main_batch()
-    else:
-        # Single file mode
-        main_single()
+    raise SystemExit(main())

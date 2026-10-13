@@ -31,6 +31,7 @@ import shutil
 sys.path.insert(0, os.path.dirname(__file__))
 
 import ABO500 as dataset_utils
+import traceback
 
 
 def voxelize_mesh(
@@ -169,7 +170,6 @@ def voxelize_glb(glb_path, sha256, output_dir, max_voxels=None):
 
     except Exception as e:
         print(f"Error voxelizing {glb_path}: {e}")
-        import traceback
 
         traceback.print_exc()
         return {"sha256": sha256, "voxelized": False, "num_voxels": 0}

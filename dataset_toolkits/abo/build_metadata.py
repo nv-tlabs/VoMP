@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # Import the local ABO500 module directly
 import ABO500 as dataset_utils
+import json
 
 
 def main():
@@ -95,8 +96,6 @@ def main():
         ),
         "output_dir": opt.output_dir,
     }
-
-    import json
 
     with open(os.path.join(opt.output_dir, "dataset_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)

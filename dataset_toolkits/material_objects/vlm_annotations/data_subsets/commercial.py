@@ -35,6 +35,9 @@ from tqdm import tqdm
 import os
 import logging
 import copy
+import traceback
+import json
+from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import UsdJsonEncoder
 
 # Use the centralized parser function
 parse_vlm_output = parse_vlm_properties
@@ -332,8 +335,6 @@ def process_commercial(
                                     f"VLM analysis failed for {segment_key}: {vlm_analysis.get('error', 'Unknown error')}"
                                 )
                         except Exception as e:
-                            import traceback
-
                             logging.error(
                                 f"Error during VLM analysis for {segment_key}: {str(e)}"
                             )
@@ -348,11 +349,6 @@ def process_commercial(
                 if output_file:
                     try:
                         with open(output_file, "w") as f:
-                            import json
-                            from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
-                                UsdJsonEncoder,
-                            )
-
                             # Debug save contents
                             logging.info(
                                 f"Saving checkpoint with {len(all_results)} objects"
@@ -386,7 +382,6 @@ def process_commercial(
 
                     except Exception as e:
                         logging.error(f"Error saving checkpoint: {str(e)}")
-                        import traceback
 
                         logging.error(traceback.format_exc())
 
@@ -395,8 +390,6 @@ def process_commercial(
                 logging.warning(f"No material information extracted for {usd_file}")
                 failed_objects.append(object_name)
         except Exception as e:
-            import traceback
-
             logging.error(f"Error processing {usd_file}: {str(e)}")
             logging.error(traceback.format_exc())
             failed_objects.append(os.path.basename(os.path.dirname(usd_file)))

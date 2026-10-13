@@ -26,27 +26,7 @@ PROPERTY_DISPLAY_NAMES = {
     "density": "Density",
 }
 
-BLENDER_LINK = (
-    "https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz"
-)
-BLENDER_INSTALLATION_PATH = "/tmp"
-BLENDER_PATH = f"{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender"
-
-EXAMPLES_DIR = "examples"
-
-
-def _install_blender():
-    if not os.path.exists(BLENDER_PATH):
-        print("Installing Blender...")
-        os.system("sudo apt-get update")
-        os.system(
-            "sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6"
-        )
-        os.system(f"wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}")
-        os.system(
-            f"tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}"
-        )
-        print("Blender installed successfully!")
+EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
 
 
 def _is_gaussian_splat(file_path: str) -> bool:
@@ -81,10 +61,10 @@ _setup_examples()
 
 print("Loading VoMP model...")
 model = Vomp.from_checkpoint(
-    config_path="weights/inference.json",
-    geometry_checkpoint_dir="weights/geometry_transformer.pt",
-    matvae_checkpoint_dir="weights/matvae.safetensors",
-    normalization_params_path="weights/normalization_params.json",
+    config_path="weights/vomp_1_1/inference.json",
+    geometry_checkpoint_dir="weights/vomp_1_1/geometry_transformer.pt",
+    matvae_checkpoint_dir="weights/vomp_1_1/matvae.safetensors",
+    normalization_params_path="weights/vomp_1_1/normalization_params.json",
 )
 print("VoMP model loaded successfully!")
 
@@ -271,10 +251,8 @@ def process_3d_model(input_file):
             )
         else:
             print(f"Processing as mesh: {input_file}")
-            _install_blender()
             results = model.get_mesh_materials(
                 input_file,
-                blender_path=BLENDER_PATH,
                 query_points="voxel_centers",
                 output_dir=output_dir,
                 return_original_scale=True,

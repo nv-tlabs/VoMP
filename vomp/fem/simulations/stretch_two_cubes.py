@@ -30,6 +30,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vomp.fem.fem_examples.mfem.softbody_sim import ClassicFEM, run_softbody_sim
 from vomp.fem.fem_examples.mfem.demo_3d import clamped_sides
+import polyscope as ps
+import polyscope.imgui as psim
 
 # -----------------------------------------------------------------------------
 # Helper: build cube geometry at given (x, z) offset and optional height (y)
@@ -270,9 +272,6 @@ def main():
 
     # Visualize using Polyscope if requested
     if args.ui:
-        import polyscope as ps
-        import polyscope.imgui as psim
-
         ps.init()
         ps.set_ground_plane_mode("shadow_only")
 
@@ -368,7 +367,6 @@ def main():
         ps.show()
     else:
         # Headless mode - save screenshots
-        import polyscope as ps
 
         ps.init()
         ps.set_ground_plane_mode("shadow_only")

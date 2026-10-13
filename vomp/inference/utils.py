@@ -20,14 +20,18 @@ This module provides supporting utilities including lazy model loading
 and material property upsampling capabilities.
 """
 
+from __future__ import annotations
+
 import os
 from typing import Optional, Union, Tuple, Dict, Any
 
 import torch
 import numpy as np
-import trimesh
-from torchvision import transforms
 from scipy.spatial import cKDTree
+
+from dataset_toolkits.dino import DINO_MODEL, DINO_REPOSITORY
+from torchvision import transforms
+import trimesh
 
 
 class LazyLoadDino:
@@ -44,10 +48,12 @@ class LazyLoadDino:
     __device__: Optional[torch.device] = None
     __use_trt__: bool = False
     __cuda_stream__: Optional[torch.cuda.Stream] = None
+    __model_name__: Optional[str] = None
+    repository = DINO_REPOSITORY
 
     def __init__(
         self,
-        model_name: str = "dinov2_vitl14_reg",
+        model_name: str = DINO_MODEL,
         device: Union[str, torch.device, None] = None,
         use_trt: bool = False,
     ):
@@ -61,6 +67,8 @@ class LazyLoadDino:
             use_trt (bool): Whether to use TensorRT acceleration for inference (significantly faster).
                 Requires torch-tensorrt package to be installed.
         """
+        if model_name != DINO_MODEL:
+            raise ValueError(f"The material pipeline requires {DINO_MODEL}")
         self.model_name = model_name
         self.use_trt = use_trt
         if device is None:
@@ -73,11 +81,20 @@ class LazyLoadDino:
         cls, model_name: str, device: torch.device, use_trt: bool = False
     ) -> None:
         """Load the DINO model and setup transforms if not already loaded"""
-        if cls.__model__ is None:
+
+        if (
+            cls.__model__ is None
+            or cls.__device__ != device
+            or cls.__use_trt__ != use_trt
+            or cls.__model_name__ != model_name
+        ):
             print(f"Loading DINO model: {model_name} on device: {device}...")
-            cls.__model__ = torch.hub.load("facebookresearch/dinov2", model_name)
+            cls.__model__ = torch.hub.load(
+                cls.repository, model_name, trust_repo=True, skip_validation=True
+            )
             cls.__model__.eval().to(device)
             cls.__device__ = device
+            cls.__model_name__ = model_name
             cls.__use_trt__ = use_trt
 
             cls.__transform__ = transforms.Compose(
@@ -101,16 +118,8 @@ class LazyLoadDino:
         """Compile the loaded DINO model with TensorRT acceleration."""
         try:
             import torch_tensorrt
-        except ImportError:
-            print(
-                "\n❌ Error: torch-tensorrt package is required for TensorRT acceleration."
-            )
-            print("Please install it using:")
-            print(
-                "pip install -U torch-tensorrt --no-deps --index-url https://download.pytorch.org/whl/cu118"
-            )
-            print("\nExiting...")
-            exit(1)
+        except ImportError as exc:
+            raise ImportError("torch-tensorrt is required when use_trt=True") from exc
 
         print("Compiling DINO model with TensorRT...")
         try:
@@ -548,6 +557,7 @@ def get_mesh_transform_params(mesh_path: str) -> Tuple[np.ndarray, float]:
             - center: 3D center point of the mesh bounding box (np.ndarray)
             - scale: Maximum dimension of the bounding box (float)
     """
+
     mesh = trimesh.load(mesh_path)
     if hasattr(mesh, "vertices"):
         mesh_vertices = mesh.vertices

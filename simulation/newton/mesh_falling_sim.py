@@ -18,6 +18,8 @@ import numpy as np
 import warp as wp
 
 import newton
+import numpy as _np
+import warp as _wp
 
 
 def main():
@@ -135,9 +137,6 @@ def main():
     # See: https://newton-physics.github.io/newton/api/_generated/newton.Model.html#newton.Model.tet_materials
     if args.materials:
         try:
-            import numpy as _np
-            import warp as _wp
-
             data = _np.load(args.materials)
             tet_count = int(model.tet_count)
 

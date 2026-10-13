@@ -26,86 +26,116 @@ from dataset_toolkits.material_objects.vlm_annotations.utils.vlm import (
 from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
     extract_materials_from_usd,
 )
+from dataset_toolkits.material_objects.vlm_annotations.vlm_input_builder import (
+    make_common_user_prompt,
+)
 import re
 from tqdm import tqdm
 import os
 import logging
 import copy
+import traceback
+import json
+from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import UsdJsonEncoder
 
 PROMPTS = {
     "few_shot_examples": (
         """
+Text-only examples (no example images are supplied for these cases):
+- These cases deliberately span compliant foams, elastomers, plastics, wood, and metals. They illustrate scale; they are not lookup bins or class defaults.
+- Do not copy a value merely because a broad label such as metal, plastic, fabric, or organic is similar. Identify the material subtype, physical form, and exact segment usage first.
+- Estimate room-temperature, dry, small-strain effective properties for the bulk material represented by the exact segment. For porous materials, density means apparent bulk density, not solid-polymer or fiber density.
+- For layered objects, annotate the isolated segment: a cushion core is bulk foam, whereas an explicitly isolated upholstery cover is textile or leather. For anisotropic materials, the required scalar modulus is an effective approximation for the loading direction most consistent with the segment's usage.
+
 Example 1:
-Material: metal
-Usage: structural component
-Object name: SteelBeam
+Material: flexible open-cell polyurethane foam
+Usage: soft seat-cushion core
+Object name: SeatCushionCore
 
-Analysis: 
-Step 1: Based on the images, this appears to be a standard structural steel with a matte gray finish.
-Step 2: The surface has medium roughness with some subtle texture visible in the reflection pattern.
-Step 3: Considering its usage as a structural component, this is likely a carbon steel alloy.
-Step 4: Comparing with reference materials, standard structural steel typically has:
-   - High stiffness (Young's modulus ~200 GPa)
-   - Medium Poisson's ratio typical of metals
-   - High density consistent with iron-based alloys
+Analysis:
+Step 1: The named segment is the compliant cushion core, not a thin upholstery cover and not solid polyurethane.
+Step 2: Open-cell foam is a porous cellular structure, so its effective bulk stiffness and apparent density are far below those of the polymer forming the cell walls.
+Step 3: Flexible seat foam is nonlinear and rate dependent; use a representative small-vibration linearized modulus for this requested scalar label.
+Step 4: A soft 65 kg/m^3 seat foam is represented by about 0.20 MPa Young's modulus and a Poisson's ratio of 0.25.
 
-Young's modulus: 2.0e11 Pa
-Poisson's ratio: 0.29
-Density: 7800 kg/m^3
+Young's modulus: 2.0e5 Pa
+Poisson's ratio: 0.25
+Density: 6.5e1 kg/m^3
 
 Example 2:
-Material: plastic
-Usage: household container
-Object name: PlasticContainer
+Material: 6061-T6 aluminum alloy
+Usage: lightweight rigid frame member
+Object name: AluminumFrame
 
 Analysis:
-Step 1: The material shows the characteristic smooth, uniform appearance of a consumer plastic.
-Step 2: It has moderate gloss with some translucency and a slight texture.
-Step 3: Given its household container application, this is likely polypropylene.
-Step 4: The visual and contextual evidence suggests:
-   - Medium-low stiffness typical of polyolefin plastics
-   - Higher Poisson's ratio indicating good lateral deformation
-   - Low-medium density typical of consumer thermoplastics
+Step 1: The stated alloy and lightweight frame usage identify aluminum rather than treating every metal-colored segment as steel.
+Step 2: Surface color or finish alone cannot determine a metal alloy, so subtype and structural usage are decisive here.
+Step 3: Wrought 6061-T6 is a stiff, low-density metal at room temperature, but is roughly three times less stiff and dense than steel.
+Step 4: Representative elastic constants are about 68.3 GPa Young's modulus, 0.33 Poisson's ratio, and 2700 kg/m^3 density.
 
-Young's modulus: 1.3e9 Pa
-Poisson's ratio: 0.42
-Density: 950 kg/m^3
+Young's modulus: 6.83e10 Pa
+Poisson's ratio: 0.33
+Density: 2.70e3 kg/m^3
 
 Example 3:
-Material: fabric
-Usage: furniture covering
-Object name: FabricCouch
+Material: cured Sylgard 184 PDMS silicone rubber
+Usage: soft vibration-isolation pad
+Object name: SiliconeIsolationPad
 
 Analysis:
-Step 1: The material shows a woven textile structure with visible fibers.
-Step 2: The surface has significant texture with a matte appearance and no specular highlights.
-Step 3: As furniture upholstery, this is likely a synthetic or natural fiber blend.
-Step 4: Based on the visual characteristics and usage:
-   - Low stiffness as expected for flexible textiles
-   - Medium-high Poisson's ratio from the woven structure
-   - Low density typical of fibrous materials
+Step 1: The exact segment is a cured silicone elastomer pad, not a rigid thermoplastic or a cellular cushion foam.
+Step 2: A solid elastomer is much denser than foam but remains highly compliant and nearly incompressible.
+Step 3: Silicone is nonlinear at large strain, so use a representative small-strain effective modulus and keep Poisson's ratio just below 0.5.
+Step 4: Typical cured Sylgard 184 values are about 2 MPa Young's modulus, 0.495 Poisson's ratio, and 1030 kg/m^3 density.
 
-Young's modulus: 1.2e8 Pa
-Poisson's ratio: 0.38
-Density: 300 kg/m^3
+Young's modulus: 2.0e6 Pa
+Poisson's ratio: 0.495
+Density: 1.03e3 kg/m^3
 
 Example 4:
-Material: organic
-Usage: decorative element
-Object name: DriedLeaf
+Material: structural carbon steel
+Usage: load-bearing beam
+Object name: CarbonSteelBeam
 
 Analysis:
-Step 1: This is an organic material with the characteristic shape and structure of a dried leaf.
-Step 2: The surface shows visible veins, a matte finish, and a brittle, thin structure.
-Step 3: As a dried leaf, it's a natural cellulose-based composite material.
-Step 4: Considering similar organic materials like paper and dried plant fibers:
-   - Low-medium stiffness in the fiber direction
-   - Medium Poisson's ratio reflecting the fibrous structure
-   - Low density typical of dried plant matter
+Step 1: The stated structural-carbon-steel subtype and beam usage identify an iron-based structural alloy rather than a generic metallic finish.
+Step 2: Geometry and usage support a load-bearing metal, while the subtype distinguishes it from aluminum, brass, or a thin plated polymer.
+Step 3: Carbon steel has high elastic stiffness and density at room temperature.
+Step 4: Representative structural-steel values are about 200 GPa Young's modulus, 0.30 Poisson's ratio, and 7850 kg/m^3 density.
 
-Young's modulus: 2.5e9 Pa
+Young's modulus: 2.0e11 Pa
 Poisson's ratio: 0.30
-Density: 400 kg/m^3
+Density: 7.85e3 kg/m^3
+
+Example 5:
+Material: clear coastal Douglas-fir wood at approximately 12 percent moisture
+Usage: furniture rail loaded primarily along the grain
+Object name: DouglasFirRail
+
+Analysis:
+Step 1: This is a solid wood member with a specified species, moisture condition, and primary loading direction, not a generic organic-material bin.
+Step 2: Wood is orthotropic; its longitudinal stiffness is much larger than its radial or tangential stiffness.
+Step 3: Because this rail is used along the grain, the requested scalar should approximate the longitudinal small-strain modulus rather than an arbitrary isotropic wood value.
+Step 4: Clear coastal Douglas-fir near 12 percent moisture is represented by about 13.4 GPa longitudinal modulus, 0.292 longitudinal-radial Poisson's ratio, and 540 kg/m^3 density.
+
+Young's modulus: 1.34e10 Pa
+Poisson's ratio: 0.292
+Density: 5.4e2 kg/m^3
+
+Example 6:
+Material: unfilled injection-molded polypropylene
+Usage: household container wall
+Object name: PolypropyleneContainer
+
+Analysis:
+Step 1: The named segment is an unfilled molded polypropylene wall, not an elastomer, foam, or fiber-reinforced engineering plastic.
+Step 2: The smooth consumer-plastic form and container usage are consistent with a low-density semicrystalline thermoplastic.
+Step 3: The precise polypropylene subtype supports a gigapascal-scale modulus, well above rubber but far below wood or metal.
+Step 4: A representative unfilled grade has about 1.2 GPa Young's modulus, 0.40 Poisson's ratio, and 905 kg/m^3 density.
+
+Young's modulus: 1.2e9 Pa
+Poisson's ratio: 0.40
+Density: 9.05e2 kg/m^3
 """
     ),
     "query_prompt": (
@@ -137,35 +167,17 @@ Critical Instructions:
 
 
 def make_user_prompt(
-    material_type, semantic_usage, object_name, has_texture_sphere=True
+    material_type,
+    semantic_usage,
+    object_name,
+    has_texture_sphere=True,
 ):
-    intro_text = (
-        """
-You are a materials science expert analyzing two images:
-1. A photo of the full object (showing how the material appears in context).
-2. A sphere with the material's texture (showing color/roughness/reflectivity in isolation).
-
-Using both images and the information below, identify the real-world material and estimate its mechanical properties.
-"""
-        if has_texture_sphere
-        else """
-You are a materials science expert analyzing an image of the full object (showing how the material appears in context).
-
-Using this image and the information below, identify the real-world material and estimate its mechanical properties.
-"""
+    del has_texture_sphere
+    return make_common_user_prompt(
+        material_type,
+        semantic_usage,
+        object_name,
     )
-
-    return f"""{intro_text}
-Material context:
-  * Material type: {material_type}
-  * Usage: {semantic_usage}
-  * Object name: {object_name}
-
-Your task is to provide three specific properties:
-1. Young's modulus (in Pa using scientific notation)
-2. Poisson's ratio (a value between 0.0 and 0.5)
-3. Density (in kg/m^3 using scientific notation)
-"""
 
 
 # Use the centralized parser function from vlm.py instead
@@ -464,8 +476,6 @@ def process_residential(
                                     f"VLM analysis failed for {segment_key}: {vlm_analysis.get('error', 'Unknown error')}"
                                 )
                         except Exception as e:
-                            import traceback
-
                             logging.error(
                                 f"Error during VLM analysis for {segment_key}: {str(e)}"
                             )
@@ -480,11 +490,6 @@ def process_residential(
                 if output_file:
                     try:
                         with open(output_file, "w") as f:
-                            import json
-                            from dataset_toolkits.material_objects.vlm_annotations.data_subsets.common import (
-                                UsdJsonEncoder,
-                            )
-
                             # Debug save contents
                             logging.info(
                                 f"Saving checkpoint with {len(all_results)} objects"
@@ -541,7 +546,6 @@ def process_residential(
 
                     except Exception as e:
                         logging.error(f"Error saving checkpoint: {str(e)}")
-                        import traceback
 
                         logging.error(traceback.format_exc())
 
@@ -550,8 +554,6 @@ def process_residential(
                 logging.warning(f"No material information extracted for {usd_file}")
                 failed_objects.append(object_name)
         except Exception as e:
-            import traceback
-
             logging.error(f"Error processing {usd_file}: {str(e)}")
             logging.error(traceback.format_exc())
             failed_objects.append(os.path.basename(os.path.dirname(usd_file)))

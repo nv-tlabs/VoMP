@@ -19,6 +19,7 @@ import torch
 import math
 from .. import SparseTensor
 from .. import DEBUG, ATTN
+import vox2seq
 
 if ATTN == "xformers":
     import xformers.ops as xops
@@ -73,9 +74,6 @@ def calc_serialization(
     seq_lens = []
     seq_batch_indices = []
     offsets = [0]
-
-    if "vox2seq" not in globals():
-        import vox2seq
 
     # Serialize the input
     serialize_coords = tensor.coords[:, 1:].clone()

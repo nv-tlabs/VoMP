@@ -36,6 +36,8 @@ from tqdm import tqdm
 import os
 import logging
 import copy
+import traceback
+import json
 
 # Use the centralized parser function
 parse_vlm_output = parse_vlm_properties
@@ -330,8 +332,6 @@ def process_vegetation(
                                     f"VLM analysis failed: {vlm_analysis.get('error', 'Unknown error')}"
                                 )
                         except Exception as e:
-                            import traceback
-
                             logging.error(f"Error during VLM analysis: {str(e)}")
                             logging.error(traceback.format_exc())
 
@@ -344,8 +344,6 @@ def process_vegetation(
                 if output_file:
                     try:
                         with open(output_file, "w") as f:
-                            import json
-
                             # Debug save contents
                             logging.info(
                                 f"Saving checkpoint with {len(all_results)} objects"
@@ -378,7 +376,6 @@ def process_vegetation(
 
                     except Exception as e:
                         logging.error(f"Error saving checkpoint: {str(e)}")
-                        import traceback
 
                         logging.error(traceback.format_exc())
 
@@ -387,8 +384,6 @@ def process_vegetation(
                 logging.warning(f"No material information extracted for {usd_file}")
                 failed_objects.append(object_name)
         except Exception as e:
-            import traceback
-
             logging.error(f"Error processing {usd_file}: {str(e)}")
             logging.error(traceback.format_exc())
             failed_objects.append(os.path.basename(os.path.dirname(usd_file)))

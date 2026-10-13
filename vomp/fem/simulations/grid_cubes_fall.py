@@ -27,6 +27,10 @@ from vomp.fem.simulations.material_grids_generated import (
     get_material_properties_setting_2,
     get_material_properties_setting_3,
 )
+import polyscope as ps
+import polyscope.imgui as psim
+import subprocess
+import glob
 
 
 def build_cube_geo(res, offset, height=2.0):
@@ -174,9 +178,6 @@ def main():
             print(f"Frame {frame+1}/{n_frames}")
 
     if args.ui:
-        import polyscope as ps
-        import polyscope.imgui as psim
-
         ps.init()
         ps.set_window_size(1920, 1080)
         ps.set_ground_plane_mode("shadow_only")
@@ -296,9 +297,6 @@ def main():
         ps.show()
     else:
         # Headless mode - save screenshots
-        import polyscope as ps
-        import subprocess
-        import glob
 
         print(f"\nRunning headless mode for material setting {args.setting}")
         print(f"Middle cube Young's modulus: {[5e4, 5e5, 1e6][args.setting-1]:.0e} Pa")

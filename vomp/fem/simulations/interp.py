@@ -22,6 +22,10 @@ import numpy as np
 import warp as wp
 import warp.fem as fem
 from vomp.fem.simulations.cube_fall import GroundCollidingSim, run_softbody_sim
+import polyscope as ps
+import polyscope.imgui as psim
+import subprocess
+import glob
 
 
 def load_material_interpolation_data():
@@ -300,9 +304,6 @@ def main():
             print(f"Frame {frame+1}/{n_frames}")
 
     if args.ui:
-        import polyscope as ps
-        import polyscope.imgui as psim
-
         ps.init()
         ps.set_window_size(1920, 1080)
         ps.set_ground_plane_mode("shadow_only")
@@ -424,11 +425,6 @@ def main():
         )
         print(f"Material properties summary saved to: {summary_file}")
     else:
-
-        import polyscope as ps
-        import subprocess
-        import glob
-
         print(f"\nRunning headless mode for material pair {args.pair}")
         print(f"Materials: {material_1['name']} → {material_2['name']}")
         print(f"Total frames: {n_frames}")

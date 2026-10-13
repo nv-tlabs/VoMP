@@ -20,9 +20,7 @@ import pandas as pd
 import numpy as np
 import hashlib
 import random
-from glob import glob
-from sklearn.model_selection import train_test_split
-from typing import Dict, List, Optional, Any, Union
+from pathlib import Path
 
 
 from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
@@ -33,21 +31,24 @@ from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
     SIMREADY_ASSET_CLASS_MAPPING,
     SIMREADY_ASSET_INFO_PATH,
 )
-from dataset_toolkits.material_objects.vlm_annotations.data_subsets import (
-    simready,
-    commercial,
-    vegetation,
-    residential,
-    common,
+from dataset_toolkits.material_objects.vlm_annotations.annotation_input_policy import (
+    asset_annotation_exclusion,
 )
+from dataset_toolkits.material_objects.vlm_annotations.asset_finder import (
+    discover_assets,
+)
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 
 def set_seeds(seed=42):
+    """Set seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
 
 
 def add_args(parser):
+    """Add dataset-specific arguments to the parser."""
     parser.add_argument(
         "--simready_dir",
         type=str,
@@ -99,6 +100,17 @@ def add_args(parser):
 
 
 def split_dataset(metadata, seed=42):
+    """
+    Split dataset into train, validation, and test sets with 80-10-10 ratio,
+    ensuring proportional class distribution across all material datasets.
+
+    Args:
+        metadata (pandas.DataFrame): DataFrame with metadata
+        seed (int): Random seed for reproducibility
+
+    Returns:
+        pandas.DataFrame: Updated DataFrame with split information
+    """
 
     np.random.seed(seed)
     random.seed(seed)
@@ -201,6 +213,17 @@ def split_dataset(metadata, seed=42):
 
 
 def get_simready_metadata(simready_dir, asset_info_path, default_class="unknown"):
+    """
+    Extract metadata from SimReady dataset.
+
+    Args:
+        simready_dir (str): Path to SimReady props directory
+        asset_info_path (str): Path to asset_info.json file
+        default_class (str): Default class to use if class information is not available
+
+    Returns:
+        list: List of metadata dictionaries
+    """
 
     asset_class_mapping = SIMREADY_ASSET_CLASS_MAPPING
 
@@ -219,41 +242,17 @@ def get_simready_metadata(simready_dir, asset_info_path, default_class="unknown"
         except Exception as e:
             print(f"Error loading asset info: {e}")
 
-    prop_dirs = []
-    if os.path.exists(simready_dir):
-        prop_dirs = [
-            d
-            for d in os.listdir(simready_dir)
-            if os.path.isdir(os.path.join(simready_dir, d))
-        ]
-
     metadata = []
-
-    for prop_name in prop_dirs:
-        prop_dir = os.path.join(simready_dir, prop_name)
-
-        usd_files = glob(os.path.join(prop_dir, "*.usd"))
-        if not usd_files:
-            continue
-
-        inst_base_files = [f for f in usd_files if "_inst_base.usd" in f]
-        base_files = [f for f in usd_files if "_base.usd" in f]
-
-        if inst_base_files:
-            usd_file = inst_base_files[0]
-        elif base_files:
-            usd_file = base_files[0]
-        else:
-            usd_file = usd_files[0]
-
+    props_root = Path(simready_dir).resolve()
+    dataset_root = props_root.parent.parent
+    for asset in discover_assets("simready", dataset_root):
+        prop_name = asset.object_name
         sha256 = hashlib.sha256(prop_name.encode()).hexdigest()
-
         prop_class = asset_class_mapping.get(prop_name, default_class)
-
         metadata.append(
             {
                 "sha256": sha256,
-                "local_path": usd_file,
+                "local_path": str(asset.path),
                 "original_name": prop_name,
                 "aesthetic_score": 1.0,
                 "rendered": False,
@@ -265,121 +264,39 @@ def get_simready_metadata(simready_dir, asset_info_path, default_class="unknown"
     return metadata
 
 
-def get_commercial_metadata(commercial_dir, default_class="commercial"):
+def _get_tree_metadata(dataset, dataset_dir, default_class):
     metadata = []
-
-    if not os.path.exists(commercial_dir):
-        print(f"Commercial directory not found: {commercial_dir}")
-        return metadata
-
-    for root, _, files in os.walk(commercial_dir):
-        for file in files:
-            if file.endswith(".usd") and not os.path.basename(root).startswith("."):
-                usd_file = os.path.join(root, file)
-
-                object_name = os.path.basename(os.path.dirname(usd_file))
-
-                sha256 = hashlib.sha256(f"{object_name}_{file}".encode()).hexdigest()
-
-                try:
-                    material_info = common.extract_materials_from_usd(
-                        usd_file, "commercial"
-                    )
-                    category = material_info.get("category", default_class)
-                except Exception:
-                    category = default_class
-
-                metadata.append(
-                    {
-                        "sha256": sha256,
-                        "local_path": usd_file,
-                        "original_name": f"{object_name}/{file}",
-                        "aesthetic_score": 1.0,
-                        "rendered": False,
-                        "class": category,
-                        "dataset": "commercial",
-                    }
-                )
-
+    for asset in discover_assets(dataset, dataset_dir):
+        if asset_annotation_exclusion(asset.key) is not None:
+            print(f"Skipping scene-level asset: {asset.relative_path}")
+            continue
+        object_name = asset.path.parent.name
+        filename = asset.path.name
+        sha256 = hashlib.sha256(f"{object_name}_{filename}".encode()).hexdigest()
+        metadata.append(
+            {
+                "sha256": sha256,
+                "local_path": str(asset.path),
+                "original_name": f"{object_name}/{filename}",
+                "aesthetic_score": 1.0,
+                "rendered": False,
+                "class": default_class,
+                "dataset": dataset,
+            }
+        )
     return metadata
+
+
+def get_commercial_metadata(commercial_dir, default_class="commercial"):
+    return _get_tree_metadata("commercial", commercial_dir, default_class)
 
 
 def get_residential_metadata(residential_dir, default_class="residential"):
-    metadata = []
-
-    if not os.path.exists(residential_dir):
-        print(f"Residential directory not found: {residential_dir}")
-        return metadata
-
-    for root, _, files in os.walk(residential_dir):
-        for file in files:
-            if file.endswith(".usd") and not os.path.basename(root).startswith("."):
-                usd_file = os.path.join(root, file)
-
-                object_name = os.path.basename(os.path.dirname(usd_file))
-
-                sha256 = hashlib.sha256(f"{object_name}_{file}".encode()).hexdigest()
-
-                try:
-                    material_info = common.extract_materials_from_usd(
-                        usd_file, "residential"
-                    )
-                    category = material_info.get("category", default_class)
-                except Exception:
-                    category = default_class
-
-                metadata.append(
-                    {
-                        "sha256": sha256,
-                        "local_path": usd_file,
-                        "original_name": f"{object_name}/{file}",
-                        "aesthetic_score": 1.0,
-                        "rendered": False,
-                        "class": category,
-                        "dataset": "residential",
-                    }
-                )
-
-    return metadata
+    return _get_tree_metadata("residential", residential_dir, default_class)
 
 
 def get_vegetation_metadata(vegetation_dir, default_class="vegetation"):
-    metadata = []
-
-    if not os.path.exists(vegetation_dir):
-        print(f"Vegetation directory not found: {vegetation_dir}")
-        return metadata
-
-    for root, _, files in os.walk(vegetation_dir):
-        for file in files:
-            if file.endswith(".usd") and not os.path.basename(root).startswith("."):
-                usd_file = os.path.join(root, file)
-
-                object_name = os.path.basename(os.path.dirname(usd_file))
-
-                sha256 = hashlib.sha256(f"{object_name}_{file}".encode()).hexdigest()
-
-                try:
-                    material_info = common.extract_materials_from_usd(
-                        usd_file, "vegetation"
-                    )
-                    category = material_info.get("category", default_class)
-                except Exception:
-                    category = default_class
-
-                metadata.append(
-                    {
-                        "sha256": sha256,
-                        "local_path": usd_file,
-                        "original_name": f"{object_name}/{file}",
-                        "aesthetic_score": 1.0,
-                        "rendered": False,
-                        "class": category,
-                        "dataset": "vegetation",
-                    }
-                )
-
-    return metadata
+    return _get_tree_metadata("vegetation", vegetation_dir, default_class)
 
 
 def get_metadata(
@@ -395,6 +312,24 @@ def get_metadata(
     skip_split=False,
     **kwargs,
 ):
+    """
+    Extract metadata from all material datasets.
+
+    Args:
+        simready_dir (str): Path to SimReady props directory
+        commercial_dir (str): Path to Commercial models directory
+        residential_dir (str): Path to Residential models directory
+        vegetation_dir (str): Path to Vegetation models directory
+        output_dir (str): Output directory to save metadata
+        asset_info_path (str): Path to asset_info.json file for SimReady
+        include_datasets (str): Comma-separated list of datasets to include
+        seed (int): Random seed for reproducibility
+        default_class (str): Default class to use if class information is not available
+        skip_split (bool): If True, skip dataset splitting
+
+    Returns:
+        pandas.DataFrame: Metadata dataframe with all datasets combined
+    """
 
     set_seeds(seed)
 
@@ -484,9 +419,19 @@ def get_metadata(
 
 
 def foreach_instance(metadata, output_dir, func, max_workers=8, desc="Processing"):
-    from concurrent.futures import ThreadPoolExecutor
-    from tqdm import tqdm
-    import pandas as pd
+    """
+    Process each instance in the combined dataset.
+
+    Args:
+        metadata (pandas.DataFrame): DataFrame with metadata
+        output_dir (str): Output directory
+        func (function): Function to apply to each instance
+        max_workers (int): Number of parallel workers
+        desc (str): Description for progress bar
+
+    Returns:
+        pandas.DataFrame: DataFrame with processing results
+    """
 
     results = []
 

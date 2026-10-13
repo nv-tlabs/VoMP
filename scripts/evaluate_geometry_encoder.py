@@ -27,12 +27,13 @@ import numpy as np
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 
-from vomp.datasets.sparse_voxel_materials import SparseVoxelMaterials
+from vomp.datasets import SparseVoxelMaterials
+from vomp.training.checkpoints import find_normalization_params
 from vomp.models.geometry_encoder import (
     ElasticGeometryEncoder,
     ElasticSLatVoxelDecoder,
 )
-from vomp.models.material_vae.beta_tc import TripletVAE
+from vomp.models import material_vae
 from vomp.utils.data_utils import recursive_to_device
 
 
@@ -77,7 +78,7 @@ def load_model(cfg):
             **cfg.models.decoder.args
         ).cuda()
 
-    matvae = TripletVAE(**cfg.models.matvae.args).cuda()
+    matvae = material_vae.from_config(cfg.models.matvae).cuda()
     matvae_loaded = False
     if cfg.get("matvae_checkpoint") is not None:
         print(f"Loading matvae checkpoint from: {cfg.matvae_checkpoint}")
@@ -624,7 +625,7 @@ def main():
         help="Checkpoint to load (latest, none, or step number)",
     )
     parser.add_argument(
-        "--data_dir", type=str, default="./data/", help="Data directory"
+        "--data_dir", type=str, default=None, help="Override dataset roots from config"
     )
     parser.add_argument(
         "--results",
@@ -656,55 +657,15 @@ def main():
     else:
         print("No checkpoint found to load")
 
-    # Determine normalization parameters file path
-    normalization_params_file = None
-    if cfg.get("matvae_checkpoint") is not None:
-        # Extract the directory containing the matvae checkpoint
-        matvae_checkpoint_path = cfg.matvae_checkpoint
-
-        # Navigate to the project directory (up from checkpoints/checkpoint_X/)
-        if "checkpoints" in matvae_checkpoint_path:
-            # For paths like: outputs/matvae/checkpoints/checkpoint_821/model.safetensors
-            # Need to go up 3 levels: model.safetensors -> checkpoint_X -> checkpoints -> project_dir
-            matvae_project_dir = os.path.dirname(
-                os.path.dirname(os.path.dirname(matvae_checkpoint_path))
-            )
-            normalization_params_file = os.path.join(
-                matvae_project_dir, "normalization_params.json"
-            )
-        else:
-            # For other checkpoint path formats, try to find the normalization params
-            checkpoint_dir = os.path.dirname(matvae_checkpoint_path)
-            normalization_params_file = os.path.join(
-                checkpoint_dir, "normalization_params.json"
-            )
-
-        if os.path.exists(normalization_params_file):
-            print(f"Found normalization parameters file: {normalization_params_file}")
-        else:
-            print(
-                f"ERROR: Could not find normalization parameters file at {normalization_params_file}"
-            )
-            print(
-                "This file is required for consistent normalization between matvae and geometry encoder training!"
-            )
-            print(
-                "Make sure the matvae was trained with the updated train_material_vae.py that saves normalization_params.json"
-            )
-            raise FileNotFoundError(
-                f"Required normalization parameters file not found: {normalization_params_file}"
-            )
-    else:
-        print("ERROR: No matvae_checkpoint specified in config!")
-        print(
-            "The matvae_checkpoint is required to locate the normalization parameters file."
-        )
-        raise ValueError(
-            "matvae_checkpoint must be specified in config to load normalization parameters"
-        )
+    normalization_params_file = find_normalization_params(cfg)
 
     val_dataset_args = cfg.dataset.args.copy()
     val_dataset_args["split"] = "test"
+    if args.data_dir is not None:
+        val_dataset_args["roots"] = args.data_dir
+    val_dataset_args.setdefault("archive_format", "benchmark")
+    val_dataset_args["random_grid_rotation"] = False
+    val_dataset_args["feature_noise_std"] = 0.0
 
     if "normalization_type" in cfg.dataset:
         val_dataset_args["normalization_type"] = cfg.dataset.normalization_type
@@ -878,7 +839,6 @@ def main():
 
     print(f"\n3. ERROR DISTRIBUTION ANALYSIS:")
     print("-" * 60)
-    import numpy as np
 
     per_obj_errors = val_metrics["per_object_errors"]
     object_ids = val_metrics.get("object_identifiers", [])

@@ -17,20 +17,38 @@ import os
 import sys
 import json
 import glob
+from functools import lru_cache
+import traceback
 import argparse
 import numpy as np
 import logging
 import copy
 from PIL import Image
 from tqdm import tqdm
-from pxr import Usd, UsdGeom, UsdShade, Sdf, Ar
+from pxr import Usd, UsdShade, Sdf, Ar
 from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
     COMMERCIAL_BASE_DIR,
     RESIDENTIAL_BASE_DIR,
     VEGETATION_BASE_DIR,
+    SIMREADY_ASSET_CLASS_MAPPING as ASSET_CLASS_MAPPING,
+    SIMREADY_MATERIALS_DIR as PHYSICS_MATERIALS_DIR,
+    round_float_to_2dp,
+)
+from dataset_toolkits.material_objects.vlm_annotations.usd_segment_reader import (
+    authored_perspective_camera_hint,
+    build_material_record,
+    collect_material_texture_evidence,
+    enumerate_material_regions,
+    material_record_extraction_errors,
+    material_record_id,
+    region_metadata,
+    select_resolved_textures,
+    stage_color_management_metadata,
+    stage_composition_errors,
 )
 import datetime
 import uuid
+import shutil
 
 
 class UsdJsonEncoder(json.JSONEncoder):
@@ -182,7 +200,6 @@ def copy_texture_to_output(
 
     try:
         # Copy the texture file
-        import shutil
 
         shutil.copy2(texture_path, output_path)
         return output_path
@@ -570,8 +587,6 @@ def extract_material_from_shader(shader_prim, object_dir, dataset_type=None):
                     texture_path = os.path.join(object_dir, rel_path)
 
                 if os.path.exists(texture_path):
-                    # If we already found a texture through our material name matching,
-                    # don't override it for vegetation materials
                     if (
                         dataset_type == "vegetation"
                         and texture_type in material_info["textures"]
@@ -1200,258 +1215,482 @@ def apply_generic_textures_to_segments(
 def extract_materials_from_usd(
     usd_file_path, dataset_type=None, output_textures_dir=None
 ):
-    """
-    Extract material information from a USD file with improved handling of material bindings.
+    """Extract exact, path-addressable material regions from a USD asset.
 
-    Args:
-        usd_file_path: Path to the USD file
-        dataset_type: Type of dataset (residential, commercial, etc.)
-
-    Returns:
-        Dictionary with material information
+    Includes nested instance proxies and inherited/collection bindings,
+    limits subsets to the ``materialBind`` family, and assigns every mesh face
+    to exactly one output region. Texture values come from authored shader inputs.
     """
-    logging.info(f"Extracting materials from {usd_file_path}")
+
+    logging.info("Extracting USD material regions from %s", usd_file_path)
     result = {
         "object_name": os.path.splitext(os.path.basename(usd_file_path))[0],
         "dataset_type": dataset_type,
-        "file_path": usd_file_path,
+        "file_path": str(usd_file_path),
         "date_processed": datetime.datetime.now().isoformat(),
         "segments": {},
+        "materials": {},
+        "segment_inventory": {},
     }
 
-    # Open the USD stage
     try:
-        stage = Usd.Stage.Open(usd_file_path)
+        stage = Usd.Stage.Open(str(usd_file_path), load=Usd.Stage.LoadAll)
         if not stage:
-            logging.error(f"Could not open USD file: {usd_file_path}")
-            return None
-    except Exception as e:
-        logging.error(f"Error opening USD file {usd_file_path}: {str(e)}")
-        return None
+            raise RuntimeError("Usd.Stage.Open returned no stage")
+    except Exception as exc:
+        logging.error("Could not open USD file %s: %s", usd_file_path, exc)
+        result["segment_inventory"] = {
+            "errors": [f"stage open failed: {type(exc).__name__}: {exc}"],
+            "warnings": [],
+            "warning_records": [],
+            "mesh_paths": [],
+            "empty_mesh_paths": [],
+            "invalid_mesh_paths": [],
+            "hole_faces": [],
+            "point_instancers": [],
+        }
+        return result
 
-    # Track all materials we find in the stage
-    all_materials = {}
+    result.update(stage_color_management_metadata(stage))
+    camera_hint = authored_perspective_camera_hint(stage)
+    if camera_hint is not None:
+        result["authored_perspective_camera_hint"] = camera_hint
 
-    # First pass: collect all materials and their properties
-    logging.info("First pass: collecting all materials")
-    for prim in stage.Traverse():
-        if prim.IsA(UsdShade.Material):
-            material = UsdShade.Material(prim)
-            material_path = str(prim.GetPath())
-            material_name = prim.GetName()
+    inventory = enumerate_material_regions(stage)
+    inventory.errors.extend(
+        error
+        for error in stage_composition_errors(stage)
+        if error not in inventory.errors
+    )
+    result["segment_inventory"] = {
+        "errors": inventory.errors,
+        "warnings": inventory.warnings,
+        "warning_records": inventory.warning_records,
+        "mesh_paths": inventory.mesh_paths,
+        "empty_mesh_paths": inventory.empty_mesh_paths,
+        "invalid_mesh_paths": inventory.invalid_mesh_paths,
+        "hole_faces": inventory.hole_faces,
+        "point_instancers": inventory.point_instancers,
+    }
 
-            # Store material info with default values
-            all_materials[material_path] = {
-                "name": material_name,
-                "material_type": material_name,  # Default to name
-                "textures": {},
-            }
-
-            # Process material's shaders to find textures
-            # Correctly get all the shader prims in this material
-            shader_prims = []
-            for child_prim in Usd.PrimRange(prim):
-                if child_prim.IsA(UsdShade.Shader):
-                    shader_prims.append(child_prim)
-
-            for shader_prim in shader_prims:
-                shader = UsdShade.Shader(shader_prim)
-                if not shader:
-                    continue
-
-                # Inspect shader inputs for textures
-                for input in shader.GetInputs():
-                    input_name = input.GetBaseName()
-
-                    # Check if this input has a connected source that's an asset
-                    if input.HasConnectedSource():
-                        source = input.GetConnectedSource()
-                        if source:
-                            source_shader, source_output, _ = source
-                            source_prim = source_shader.GetPrim()
-
-                            # Check if the source is a texture
-                            if source_prim.IsA(UsdShade.Shader):
-                                source_shader_id = UsdShade.Shader(
-                                    source_prim
-                                ).GetShaderId()
-                                if "texture" in str(source_shader_id).lower():
-                                    # Try to find the file asset path
-                                    for source_input in UsdShade.Shader(
-                                        source_prim
-                                    ).GetInputs():
-                                        if source_input.GetBaseName() in [
-                                            "file",
-                                            "filename",
-                                            "filePath",
-                                            "varname",
-                                        ]:
-                                            asset_path = source_input.Get()
-                                            if asset_path:
-                                                # Determine texture type from connection patterns
-                                                tex_type = "unknown"
-                                                if (
-                                                    "diffuse" in input_name.lower()
-                                                    or "albedo" in input_name.lower()
-                                                    or "color" in input_name.lower()
-                                                ):
-                                                    tex_type = "diffuse"
-                                                elif "normal" in input_name.lower():
-                                                    tex_type = "normal"
-                                                elif "roughness" in input_name.lower():
-                                                    tex_type = "roughness"
-                                                elif "metallic" in input_name.lower():
-                                                    tex_type = "metallic"
-                                                elif "specular" in input_name.lower():
-                                                    tex_type = "specular"
-                                                elif (
-                                                    "displacement" in input_name.lower()
-                                                ):
-                                                    tex_type = "displacement"
-
-                                                # Store texture path
-                                                logging.info(
-                                                    f"Found texture: {tex_type} = {asset_path} for material {material_name}"
-                                                )
-                                                all_materials[material_path][
-                                                    "textures"
-                                                ][tex_type] = str(asset_path)
-
-                    # Direct asset inputs (not connected through other shaders)
-                    elif input.GetTypeName() == "asset":
-                        asset_path = input.Get()
-                        if asset_path:
-                            # Determine texture type from input name
-                            tex_type = "unknown"
-                            if (
-                                "diffuse" in input_name.lower()
-                                or "albedo" in input_name.lower()
-                                or "color" in input_name.lower()
-                            ):
-                                tex_type = "diffuse"
-                            elif "normal" in input_name.lower():
-                                tex_type = "normal"
-                            elif "roughness" in input_name.lower():
-                                tex_type = "roughness"
-                            elif "metallic" in input_name.lower():
-                                tex_type = "metallic"
-                            elif "specular" in input_name.lower():
-                                tex_type = "specular"
-                            elif "displacement" in input_name.lower():
-                                tex_type = "displacement"
-
-                            # Store texture path
-                            logging.info(
-                                f"Found direct texture: {tex_type} = {asset_path} for material {material_name}"
-                            )
-                            all_materials[material_path]["textures"][tex_type] = str(
-                                asset_path
-                            )
-
-    # Second pass: find all material bindings
-    logging.info("Second pass: finding material bindings")
-
-    # Process meshes and their subsets
-    for prim in stage.Traverse():
-        if prim.IsA(UsdGeom.Mesh):
-            mesh = UsdGeom.Mesh(prim)
-            mesh_name = prim.GetName()
-            logging.info(f"Processing mesh: {mesh_name}")
-
-            # First check direct binding on the mesh
-            binding_api = UsdShade.MaterialBindingAPI(prim)
-            direct_binding = binding_api.GetDirectBinding()
-            direct_material = None
-
-            if direct_binding.GetMaterial():
-                direct_material = direct_binding.GetMaterial()
-                material_path = str(direct_material.GetPath())
-                logging.info(f"  Found direct material binding: {material_path}")
-
-                if material_path in all_materials:
-                    # Create segment for the whole mesh
-                    segment_key = f"{mesh_name}_whole"
-                    material_info = all_materials[material_path].copy()
-                    material_info["semantic_usage"] = mesh_name
-
-                    result["segments"][segment_key] = material_info
-                    logging.info(
-                        f"  Created segment {segment_key} with material {material_path}"
-                    )
-
-            # Then check GeomSubsets - these are more specific material assignments
-            imageable = UsdGeom.Imageable(prim)
-            subsets = UsdGeom.Subset.GetGeomSubsets(imageable)
-
-            if subsets:
-                logging.info(f"  Found {len(subsets)} geom subsets for {mesh_name}")
-                for subset in subsets:
-                    subset_prim = subset.GetPrim()
-                    subset_name = subset_prim.GetName()
-                    family = (
-                        subset.GetFamilyNameAttr().Get()
-                        if subset.GetFamilyNameAttr()
-                        else "unknown"
-                    )
-
-                    logging.info(
-                        f"  Processing subset: {subset_name} (Family: {family})"
-                    )
-
-                    # Check material binding on subset
-                    subset_binding_api = UsdShade.MaterialBindingAPI(subset_prim)
-                    subset_direct_binding = subset_binding_api.GetDirectBinding()
-
-                    if subset_direct_binding.GetMaterial():
-                        subset_material = subset_direct_binding.GetMaterial()
-                        subset_material_path = str(subset_material.GetPath())
-                        logging.info(
-                            f"    Found subset material binding: {subset_material_path}"
-                        )
-
-                        if subset_material_path in all_materials:
-                            # Create segment for this subset
-                            segment_key = subset_name
-                            material_info = all_materials[subset_material_path].copy()
-                            material_info["semantic_usage"] = subset_name
-
-                            result["segments"][segment_key] = material_info
-                            logging.info(
-                                f"    Created segment {segment_key} with material {subset_material_path}"
-                            )
-
-            # If no subsets but we have a direct material, use that
-            if not subsets and direct_material:
-                material_path = str(direct_material.GetPath())
-
-                if material_path in all_materials:
-                    # Create segment for the whole mesh
-                    segment_key = mesh_name
-                    material_info = all_materials[material_path].copy()
-                    material_info["semantic_usage"] = mesh_name
-
-                    result["segments"][segment_key] = material_info
-                    logging.info(
-                        f"  No subsets, created segment {segment_key} with material {material_path}"
-                    )
-
-    # Final check - make sure we have segments
-    if not result["segments"]:
-        logging.warning(f"No material segments found in {usd_file_path}")
-
-        # Last resort - add all materials as segments
-        for material_path, material_info in all_materials.items():
-            material_name = material_info["name"]
-            segment_key = f"material_{material_name}"
-
-            result["segments"][segment_key] = material_info.copy()
-            result["segments"][segment_key]["semantic_usage"] = material_name
-
-            logging.info(
-                f"Added material {material_name} as segment {segment_key} (last resort)"
+    material_cache = {}
+    for region in inventory.regions:
+        material = region.material
+        material_name = material.GetPrim().GetName() if material else "unknown_material"
+        for purpose_material in region.materials_by_binding_purpose.values():
+            if not purpose_material:
+                continue
+            purpose_record_id = material_record_id(purpose_material)
+            if purpose_record_id in material_cache:
+                continue
+            record = build_material_record(
+                purpose_material, root_layer=stage.GetRootLayer()
             )
+            if record:
+                material_cache.setdefault(record["material_record_id"], record)
+                for error in material_record_extraction_errors(record):
+                    if error not in inventory.errors:
+                        inventory.errors.append(error)
+                for warning in record.get("annotation_warnings", []):
+                    if warning not in inventory.warning_records:
+                        inventory.warning_records.append(warning)
+                    message = str(warning.get("message") or warning.get("code"))
+                    if message and message not in inventory.warnings:
+                        inventory.warnings.append(message)
+        metadata = region_metadata(region)
+        selected_record_id = metadata["material_record_id"]
+        selected_record = (
+            material_cache.get(selected_record_id) if selected_record_id else None
+        )
+        textures = (
+            selected_record["selected_surface_textures"] if selected_record else {}
+        )
+        selected_texture_evidence = (
+            selected_record["selected_surface_texture_evidence"]
+            if selected_record
+            else {}
+        )
+        texture_candidates = (
+            selected_record["surface_texture_candidates"] if selected_record else {}
+        )
+        unresolved_textures = (
+            selected_record["unresolved_surface_textures"] if selected_record else []
+        )
+        texture_role_conflicts = (
+            selected_record["surface_texture_role_conflicts"]
+            if selected_record
+            else []
+        )
+        texture_ambiguities = (
+            selected_record["surface_texture_ambiguities"]
+            if selected_record
+            else []
+        )
+        unknown_texture_roles = (
+            selected_record["surface_unknown_texture_roles"]
+            if selected_record
+            else []
+        )
+        texture_fallbacks = selected_record["texture_fallbacks"] if selected_record else []
+        source_repairs = selected_record["source_repairs"] if selected_record else []
+        annotation_warnings = (
+            selected_record["annotation_warnings"]
+            if selected_record
+            else []
+        )
+
+        selected_textures = dict(textures)
+        if output_textures_dir:
+            for texture_type, texture_path in textures.items():
+                copied_path = copy_texture_to_output(
+                    texture_path,
+                    output_textures_dir,
+                    result["object_name"],
+                    material_name,
+                    texture_type,
+                )
+                if copied_path:
+                    selected_textures[f"{texture_type}_copied"] = copied_path
+
+        segment_info = {
+            "name": material_name,
+            "material_type": material_name,
+            "semantic_usage": region.semantic_usage,
+            "textures": selected_textures,
+            "selected_surface_texture_evidence": selected_texture_evidence,
+            "texture_candidates": texture_candidates,
+            "unresolved_textures": [],
+            "texture_role_conflicts": [],
+            "texture_ambiguities": [],
+            "unknown_texture_roles": [],
+            "appearance_evidence_warnings": annotation_warnings,
+            "unresolved_texture_evidence": unresolved_textures,
+            "texture_role_conflict_evidence": texture_role_conflicts,
+            "texture_ambiguity_evidence": texture_ambiguities,
+            "unknown_texture_role_evidence": unknown_texture_roles,
+            "texture_fallbacks": texture_fallbacks,
+            "source_repairs": source_repairs,
+        }
+        segment_info.update(metadata)
+        result["segments"][region.key] = segment_info
+
+    result["materials"] = material_cache
 
     logging.info(
-        f"Extracted {len(result['segments'])} material segments from {usd_file_path}"
+        "Extracted %d exact material regions across %d meshes from %s",
+        len(result["segments"]),
+        len(inventory.mesh_paths),
+        usd_file_path,
+    )
+    return result
+
+
+@lru_cache(maxsize=1)
+def load_physics_materials():
+    """
+    Load physics material properties from USD files.
+
+    Returns:
+        dict: Dictionary mapping material types to physics properties
+    """
+    physics_materials = {}
+
+    # Check if physics materials directory exists
+    if not os.path.isdir(PHYSICS_MATERIALS_DIR):
+        print(
+            f"Warning: Physics materials directory not found at {PHYSICS_MATERIALS_DIR}"
+        )
+        print("Physics properties will not be available.")
+        return physics_materials
+
+    # Load each physics material file
+    for usda_file in glob.glob(os.path.join(PHYSICS_MATERIALS_DIR, "physics_*.usda")):
+        material_name = (
+            os.path.basename(usda_file).replace("physics_", "").replace(".usda", "")
+        )
+
+        try:
+            stage = Usd.Stage.Open(usda_file)
+            if not stage:
+                print(f"Warning: Could not open physics material file {usda_file}")
+                continue
+
+            # Find material prims with PhysicsMaterialAPI
+            material_prims = []
+            for prim in stage.Traverse():
+                # Check if the prim is a Material and has PhysicsMaterialAPI applied
+                if prim.IsA(UsdShade.Material) or "PhysicsMaterialAPI" in [
+                    s.GetName() for s in prim.GetAppliedSchemas()
+                ]:
+                    material_prims.append(prim)
+
+            if not material_prims:
+                # Try to find any prim with physics attributes as a fallback
+                for prim in stage.Traverse():
+                    if prim.HasAttribute("physics:density") or prim.HasAttribute(
+                        "physics:dynamicFriction"
+                    ):
+                        material_prims.append(prim)
+                        break
+
+            if not material_prims:
+                print(f"Warning: No physics material found in {usda_file}")
+                continue
+
+            material_prim = material_prims[0]
+
+            # Extract physics properties
+            density = (
+                material_prim.GetAttribute("physics:density").Get()
+                if material_prim.HasAttribute("physics:density")
+                else None
+            )
+            dynamic_friction = (
+                material_prim.GetAttribute("physics:dynamicFriction").Get()
+                if material_prim.HasAttribute("physics:dynamicFriction")
+                else None
+            )
+            static_friction = (
+                material_prim.GetAttribute("physics:staticFriction").Get()
+                if material_prim.HasAttribute("physics:staticFriction")
+                else None
+            )
+            restitution = (
+                material_prim.GetAttribute("physics:restitution").Get()
+                if material_prim.HasAttribute("physics:restitution")
+                else None
+            )
+
+            # Round values to 2 decimal places
+            physics_materials[material_name] = {
+                "density": round_float_to_2dp(density),
+                "dynamic_friction": round_float_to_2dp(dynamic_friction),
+                "static_friction": round_float_to_2dp(static_friction),
+                "restitution": round_float_to_2dp(restitution),
+            }
+
+
+        except Exception as e:
+            print(f"Error loading physics material {usda_file}: {str(e)}")
+
+            traceback.print_exc()
+
+    return physics_materials
+
+
+def parse_material_name(material_name):
+    """
+    Parse a material name according to the SimReady convention.
+    Format: opacity__material-type__specific-usage
+
+    Args:
+        material_name (str): Material name
+
+    Returns:
+        tuple: (opacity, material_type, semantic_usage)
+    """
+    parts = material_name.split("__")
+
+    if len(parts) >= 3:
+        opacity = parts[0]
+        material_type = parts[1]
+        semantic_usage = "__".join(parts[2:])
+    elif len(parts) == 2:
+        opacity = parts[0]
+        material_type = parts[1]
+        semantic_usage = ""
+    else:
+        # Default values if the name doesn't follow the convention
+        opacity = "unknown"
+        material_type = material_name
+        semantic_usage = ""
+
+    return opacity, material_type, semantic_usage
+
+
+def extract_simready_materials_from_usd(usd_file_path, prop_name=None, prop_dir=None):
+    """Extract every exact SimReady mesh-face material region.
+
+    Effective USD bindings are computed for each region, so inherited and
+    collection bindings cannot cause a mesh to disappear.  Only textures
+    authored on the connected material graph are returned; directory-wide
+    texture guessing is intentionally excluded.
+    """
+
+    object_name = prop_name or os.path.basename(os.path.dirname(usd_file_path))
+    result = {
+        "object_name": object_name,
+        "category": ASSET_CLASS_MAPPING.get(object_name, "unknown"),
+        "dataset_type": "simready",
+        "file_path": str(usd_file_path),
+        "segments": {},
+        "materials": {},
+        "segment_inventory": {},
+    }
+    if not os.path.isfile(usd_file_path):
+        result["segment_inventory"] = {
+            "errors": [f"USD entry point is missing: {usd_file_path}"],
+            "warnings": [],
+            "warning_records": [],
+            "mesh_paths": [],
+            "empty_mesh_paths": [],
+            "invalid_mesh_paths": [],
+            "hole_faces": [],
+            "point_instancers": [],
+        }
+        return result
+
+    try:
+        stage = Usd.Stage.Open(str(usd_file_path), load=Usd.Stage.LoadAll)
+        if not stage:
+            raise RuntimeError("Usd.Stage.Open returned no stage")
+    except Exception as exc:
+        result["segment_inventory"] = {
+            "errors": [f"stage open failed: {type(exc).__name__}: {exc}"],
+            "warnings": [],
+            "warning_records": [],
+            "mesh_paths": [],
+            "empty_mesh_paths": [],
+            "invalid_mesh_paths": [],
+            "hole_faces": [],
+            "point_instancers": [],
+        }
+        return result
+
+    result.update(stage_color_management_metadata(stage))
+    camera_hint = authored_perspective_camera_hint(stage)
+    if camera_hint is not None:
+        result["authored_perspective_camera_hint"] = camera_hint
+
+    inventory = enumerate_material_regions(stage)
+    inventory.errors.extend(
+        error
+        for error in stage_composition_errors(stage)
+        if error not in inventory.errors
+    )
+    result["segment_inventory"] = {
+        "errors": inventory.errors,
+        "warnings": inventory.warnings,
+        "warning_records": inventory.warning_records,
+        "mesh_paths": inventory.mesh_paths,
+        "empty_mesh_paths": inventory.empty_mesh_paths,
+        "invalid_mesh_paths": inventory.invalid_mesh_paths,
+        "hole_faces": inventory.hole_faces,
+        "point_instancers": inventory.point_instancers,
+    }
+    physics_materials = load_physics_materials()
+    material_cache = {}
+
+    for region in inventory.regions:
+        material = region.material
+        material_name = material.GetPrim().GetName() if material else "unknown_material"
+        opacity, material_type, material_usage = parse_material_name(material_name)
+        physics_props = physics_materials.get(material_type, {})
+
+        for purpose_material in region.materials_by_binding_purpose.values():
+            if not purpose_material:
+                continue
+            purpose_record_id = material_record_id(purpose_material)
+            if purpose_record_id in material_cache:
+                continue
+            record = build_material_record(
+                purpose_material, root_layer=stage.GetRootLayer()
+            )
+            if record:
+                material_cache.setdefault(record["material_record_id"], record)
+                for error in material_record_extraction_errors(record):
+                    if error not in inventory.errors:
+                        inventory.errors.append(error)
+                for warning in record.get("annotation_warnings", []):
+                    if warning not in inventory.warning_records:
+                        inventory.warning_records.append(warning)
+                    message = str(warning.get("message") or warning.get("code"))
+                    if message and message not in inventory.warnings:
+                        inventory.warnings.append(message)
+        metadata = region_metadata(region)
+        selected_record_id = metadata["material_record_id"]
+        selected_record = (
+            material_cache.get(selected_record_id) if selected_record_id else None
+        )
+        textures = (
+            selected_record["selected_surface_textures"] if selected_record else {}
+        )
+        selected_texture_evidence = (
+            selected_record["selected_surface_texture_evidence"]
+            if selected_record
+            else {}
+        )
+        texture_candidates = (
+            selected_record["surface_texture_candidates"] if selected_record else {}
+        )
+        unresolved_textures = (
+            selected_record["unresolved_surface_textures"] if selected_record else []
+        )
+        texture_role_conflicts = (
+            selected_record["surface_texture_role_conflicts"]
+            if selected_record
+            else []
+        )
+        texture_ambiguities = (
+            selected_record["surface_texture_ambiguities"]
+            if selected_record
+            else []
+        )
+        unknown_texture_roles = (
+            selected_record["surface_unknown_texture_roles"]
+            if selected_record
+            else []
+        )
+        texture_fallbacks = selected_record["texture_fallbacks"] if selected_record else []
+        source_repairs = selected_record["source_repairs"] if selected_record else []
+        annotation_warnings = (
+            selected_record["annotation_warnings"]
+            if selected_record
+            else []
+        )
+
+        segment_info = {
+            "name": material_name,
+            "opacity": opacity,
+            "material_type": material_type,
+            "material_usage": material_usage or None,
+            "semantic_usage": material_usage or region.semantic_usage,
+            "source_physics": {
+                "density": round_float_to_2dp(physics_props.get("density")),
+                "dynamic_friction": round_float_to_2dp(
+                    physics_props.get("dynamic_friction")
+                ),
+                "static_friction": round_float_to_2dp(
+                    physics_props.get("static_friction")
+                ),
+                "restitution": round_float_to_2dp(
+                    physics_props.get("restitution")
+                ),
+            },
+            "textures": dict(textures),
+            "selected_surface_texture_evidence": selected_texture_evidence,
+            "texture_candidates": texture_candidates,
+            "unresolved_textures": [],
+            "texture_role_conflicts": [],
+            "texture_ambiguities": [],
+            "unknown_texture_roles": [],
+            "appearance_evidence_warnings": annotation_warnings,
+            "unresolved_texture_evidence": unresolved_textures,
+            "texture_role_conflict_evidence": texture_role_conflicts,
+            "texture_ambiguity_evidence": texture_ambiguities,
+            "unknown_texture_role_evidence": unknown_texture_roles,
+            "texture_fallbacks": texture_fallbacks,
+            "source_repairs": source_repairs,
+        }
+        segment_info.update(metadata)
+        result["segments"][region.key] = segment_info
+
+    result["materials"] = material_cache
+
+    logging.info(
+        "Extracted %d exact SimReady regions across %d meshes from %s",
+        len(result["segments"]),
+        len(inventory.mesh_paths),
+        usd_file_path,
     )
     return result

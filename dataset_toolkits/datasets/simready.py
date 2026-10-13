@@ -22,6 +22,8 @@ import hashlib
 import random
 from glob import glob
 from sklearn.model_selection import train_test_split
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 
 def set_seeds(seed=42):
@@ -273,10 +275,6 @@ def get_metadata(
 
 
 def foreach_instance(metadata, output_dir, func, max_workers=8, desc="Processing"):
-    from concurrent.futures import ThreadPoolExecutor
-    from tqdm import tqdm
-    import pandas as pd
-
     results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

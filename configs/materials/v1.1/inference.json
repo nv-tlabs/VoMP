@@ -1,0 +1,52 @@
+{
+    "geometry_checkpoint_dir": "weights/vomp_1_1/geometry_transformer.pt",
+    "matvae_checkpoint_dir": "weights/vomp_1_1/matvae.safetensors",
+    "normalization_params_path": "weights/vomp_1_1/normalization_params.json",
+    "matvae_checkpoint": "weights/vomp_1_1/matvae.safetensors",
+    "trellis_weights_path": "weights/TRELLIS-image-large",
+    "models": {
+        "geometry_encoder": {
+            "name": "geometry_encoder",
+            "args": {
+                "resolution": 64,
+                "in_channels": 1024,
+                "model_channels": 768,
+                "latent_channels": 2,
+                "num_blocks": 12,
+                "num_heads": 12,
+                "mlp_ratio": 4,
+                "attn_mode": "swin",
+                "window_size": 8,
+                "use_fp16": true
+            }
+        },
+        "matvae": {
+            "name": "StandardVAE",
+            "args": {
+                "width": 256,
+                "depth": 3,
+                "z_dim": 2,
+                "p_drop": 0.05,
+                "use_learned_variances": false,
+                "use_additional_losses": true,
+                "use_flow": false
+            }
+        }
+    },
+    "dataset": {
+        "name": "SparseVoxelMaterials",
+        "normalization_type": "log_minmax",
+        "args": {
+            "roots": "datasets/simready",
+            "image_size": 512,
+            "model": "dinov2_vitl14_reg",
+            "resolution": 64,
+            "min_aesthetic_score": 0.0,
+            "max_num_voxels": 32768,
+            "compute_material_stats": false,
+            "archive_format": "mapped",
+            "random_grid_rotation": false,
+            "segment_balanced_sampling": true
+        }
+    }
+}

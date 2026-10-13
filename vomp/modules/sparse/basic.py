@@ -18,21 +18,10 @@ import torch
 import torch.nn as nn
 from . import BACKEND, DEBUG
 
-SparseTensorData = None  # Lazy import
-
-
-def _ensure_sparse_tensor_data():
-    """Ensure SparseTensorData is imported"""
-    global SparseTensorData
-    if SparseTensorData is None:
-        import importlib
-
-        if BACKEND == "torchsparse":
-            SparseTensorData = importlib.import_module("torchsparse").SparseTensor
-        elif BACKEND == "spconv":
-            SparseTensorData = importlib.import_module(
-                "spconv.pytorch"
-            ).SparseConvTensor
+if BACKEND == "torchsparse":
+    from torchsparse import SparseTensor as SparseTensorData
+elif BACKEND == "spconv":
+    from spconv.pytorch import SparseConvTensor as SparseTensorData
 
 
 __all__ = [
@@ -80,8 +69,6 @@ class SparseTensor:
     ): ...
 
     def __init__(self, *args, **kwargs):
-        # Lazy import of sparse tensor backend
-        _ensure_sparse_tensor_data()
         method_id = 0
         if len(args) != 0:
             method_id = 0 if isinstance(args[0], torch.Tensor) else 1
@@ -301,7 +288,6 @@ class SparseTensor:
     def replace(
         self, feats: torch.Tensor, coords: Optional[torch.Tensor] = None
     ) -> "SparseTensor":
-        _ensure_sparse_tensor_data()
         new_shape = [self.shape[0]]
         new_shape.extend(feats.shape[1:])
         if BACKEND == "torchsparse":

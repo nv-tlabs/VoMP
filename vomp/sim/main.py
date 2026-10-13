@@ -33,6 +33,8 @@ from vomp.sim.meshes import (
     write_visual_meshes_obj,
     embed_visual_mesh_in_physics_tets,
 )
+import math
+from scipy.spatial import cKDTree
 
 
 def create_output_dir(output_path):
@@ -291,7 +293,6 @@ def run_with_gui(world, scene, sio, obj_output_dir, save_meshes, all_meshes, con
             if "rotation" in obj_config:
                 r = obj_config["rotation"]
                 # Convert degrees to radians and apply rotations in order: Z, Y, X
-                import math
 
                 if r[2] != 0:
                     angle_rad = math.radians(r[2])
@@ -424,7 +425,6 @@ def run_with_gui(world, scene, sio, obj_output_dir, save_meshes, all_meshes, con
             )
 
             # Sanity check: compute distance between closest visual vertex and physics vertex
-            from scipy.spatial import cKDTree
 
             physics_tree = cKDTree(physics_pos_array)
             sample_visual_vertices = aligned_visual_vertices[
@@ -641,7 +641,6 @@ def run_with_gui(world, scene, sio, obj_output_dir, save_meshes, all_meshes, con
                 if "rotation" in obj_config:
                     r = obj_config["rotation"]
                     # Convert degrees to radians and apply rotations in order: Z, Y, X
-                    import math
 
                     if r[2] != 0:
                         angle_rad = math.radians(r[2])

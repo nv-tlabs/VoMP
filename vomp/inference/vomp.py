@@ -13,122 +13,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Main Vomp model class for material property inference.
 
-This module contains the core Vomp model that combines geometry encoding,
-feature extraction, and material property prediction for 3D objects.
-"""
 
-import os
+from __future__ import annotations
+
 import copy
-import json
 import glob
+import json
 import math
-from typing import Dict, Any, Optional, Union, Tuple, List, Protocol
-from subprocess import DEVNULL, call
+import os
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import trimesh
-from PIL import Image
-from safetensors.torch import load_file
+
+from dataset_toolkits.dino import DINO_MODEL, DINO_REPOSITORY, render_hash
+from dataset_toolkits.material_objects import camera
+from dataset_toolkits.material_objects.camera import DEFAULT_CAMERA_SEED, resolve_camera_id
+from dataset_toolkits.voxel_sampling import MAX_DINO_VOXELS, sample_voxel_rows
+from .ply_utils import read_ply_vertices, write_ply_vertices
+from .utils import LazyLoadDino, MaterialUpsampler, denormalize_coords
 from easydict import EasyDict as edict
-from scipy.spatial.distance import cdist
-from vomp.inference.ply_utils import write_ply_vertices, read_ply_vertices
-import utils3d
-from diff_gaussian_rasterization import (
-    GaussianRasterizationSettings,
-    GaussianRasterizer,
-)
-
-import kaolin.ops.conversions.gaussians as gs_ops
-
-from vomp.models.geometry_encoder import (
-    ElasticGeometryEncoder,
-    ElasticSLatVoxelDecoder,
-)
-from vomp.models.material_vae.beta_tc import TripletVAE
-from vomp.utils.data_utils import recursive_to_device
-from vomp.modules.sparse import SparseTensor
 from vomp.utils.material_transforms import MaterialPropertyTransform
-from vomp.utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
-from vomp.inference.utils import (
-    LazyLoadDino,
-    MaterialUpsampler,
-    get_mesh_transform_params,
-    denormalize_coords,
-)
+from vomp.models.geometry_encoder import ElasticGeometryEncoder, ElasticSLatVoxelDecoder
+from safetensors.torch import load_file
+from vomp.models import material_vae
+from vomp.modules.sparse import SparseTensor
+from vomp.datasets.sparse_voxel_materials import _segment_balanced_random_rows
+from PIL import Image
+from gsplat import rasterization
 from vomp.representations.gaussian import Gaussian
+import kaolin.ops.conversions.gaussians as gs_ops
+from dataset_toolkits.extract_feature import IMAGE_SIZE, extract_features, load_views_from_directory
+from scipy.spatial.distance import cdist
 from vomp.inference.replicator_renderer import render_with_replicator
-from vomp.inference.usd_utils import convert_usd_to_obj
-import tempfile
-import shutil
-import multiprocessing
-from functools import partial
-from subprocess import PIPE, Popen
 
 
 class RenderFunction(Protocol):
-    """Protocol for custom rendering functions."""
+    """Custom rendering function returning view metadata and RGBA images."""
 
     def __call__(
-        self,
-        obj_3d: Any,
-        output_dir: str,
-        num_views: int,
-        image_size: int,
+        self, obj_3d: Any, output_dir: str, num_views: int, image_size: int,
         **kwargs: Any,
-    ) -> List[Dict[str, Any]]:
-        """Render object and return frame metadata."""
-        ...
+    ) -> List[Dict[str, Any]]: ...
 
 
 class VoxelizeFunction(Protocol):
-    """Protocol for custom voxelization functions."""
+    """Custom voxelization function returning normalized occupied cell centers."""
 
-    def __call__(self, obj_3d: Any, output_dir: str, **kwargs: Any) -> np.ndarray:
-        """Voxelize object and return voxel centers as (N, 3) array."""
-        ...
+    def __call__(self, obj_3d: Any, output_dir: str, **kwargs: Any) -> np.ndarray: ...
 
 
 class Vomp(nn.Module):
+    """Infer material properties from meshes, USD assets, splats or voxel features.
+
+    The supplied config selects the geometry encoder, material VAE,
+    normalization and checkpoints. All configurations use the shared rendering,
+    voxelization and DINO feature pipeline.
     """
-    End-to-end material property inference model for 3D objects.
 
-    Vomp combines geometry encoding, visual feature extraction via DINO,
-    and material VAE to predict mechanical properties (Young's modulus, Poisson's
-    ratio, density) from 3D representations including Gaussian splats and meshes.
-
-    The model processes 3D objects through the following pipeline:
-    1. Multi-view rendering from sampled camera positions
-    2. Voxelization of the 3D geometry
-    3. DINO feature extraction from rendered views
-    4. Geometry encoding with transformer architecture
-    5. Material property prediction via VAE decoder
-
-    Supports both high-level APIs (get_splat_materials, get_mesh_materials) and
-    low-level APIs (get_features, predict_materials) for custom workflows.
-
-    Examples:
-        >>> # High-level API for Gaussian splats
-        >>> model = Vomp.from_checkpoint(config_path, geo_dir, mat_dir, norm_path)
-        >>> results = model.get_splat_materials("gaussian.ply")
-        >>>
-        >>> # High-level API for meshes
-        >>> results = model.get_mesh_materials("mesh.obj")
-        >>>
-        >>> # Custom workflow
-        >>> coords, features = model.get_features(obj, render_func, voxel_func)
-        >>> results = model.predict_materials(coords, features)
-    """
+    _dino_loader = LazyLoadDino
 
     def __init__(
         self,
         geometry_encoder: ElasticGeometryEncoder,
-        matvae: TripletVAE,
+        matvae: nn.Module,
         material_transform: MaterialPropertyTransform,
         decoder: Optional[ElasticSLatVoxelDecoder] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -233,32 +183,33 @@ class Vomp(nn.Module):
         Examples:
             # Using inference config (recommended)
             >>> model = Vomp.from_checkpoint(
-            ...     config_path="configs/materials/inference.json"
+            ...     config_path="configs/materials/v1.1/inference.json"
             ... )
 
             # Using inference config with overrides
             >>> model = Vomp.from_checkpoint(
-            ...     config_path="configs/materials/inference.json",
+            ...     config_path="configs/materials/v1.1/inference.json",
             ...     geometry_checkpoint_dir="custom/path/to/geometry_transformer.pt"
             ... )
 
             # Using training config with direct file paths
             >>> model = Vomp.from_checkpoint(
-            ...     config_path="configs/materials/geometry_encoder/train.json",
-            ...     geometry_checkpoint_dir="weights/geometry_transformer.pt",
-            ...     matvae_checkpoint_dir="weights/matvae.safetensors",
-            ...     normalization_params_path="weights/normalization_params.json"
+            ...     config_path="configs/materials/v1.1/geometry_encoder/train.json",
+            ...     geometry_checkpoint_dir="weights/vomp_1_1/geometry_transformer.pt",
+            ...     matvae_checkpoint_dir="weights/vomp_1_1/matvae.safetensors",
+            ...     normalization_params_path="weights/vomp_1_1/normalization_params.json"
             ... )
 
             # Using training config with directories (advanced)
             >>> model = Vomp.from_checkpoint(
-            ...     config_path="configs/materials/geometry_encoder/train.json",
-            ...     geometry_checkpoint_dir="outputs/fixes/normal",
-            ...     matvae_checkpoint_dir="outputs/matvae2",
-            ...     normalization_params_path="outputs/matvae2/normalization_params.json",
+            ...     config_path="configs/materials/v1.1/geometry_encoder/train.json",
+            ...     geometry_checkpoint_dir="outputs/vomp1.1/geometry_encoder",
+            ...     matvae_checkpoint_dir="outputs/vomp1.1/matvae/final_model",
+            ...     normalization_params_path="outputs/vomp1.1/matvae/normalization_params.json",
             ...     geometry_ckpt="latest"
             ... )
         """
+
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -349,7 +300,7 @@ class Vomp(nn.Module):
         # Warmup DINO model with TensorRT
         if use_trt:
             print("Warming up DINO model with TensorRT...")
-            dino = LazyLoadDino(
+            dino = cls._dino_loader(
                 model_name="dinov2_vitl14_reg", device=device, use_trt=True
             )
             # Trigger model loading and TensorRT compilation
@@ -567,21 +518,10 @@ class Vomp(nn.Module):
             FileNotFoundError: If normalization_params_file doesn't exist
             KeyError: If required parameters are missing from the file
         """
-        with open(normalization_params_file, "r") as f:
-            params = json.load(f)
 
-        transform = MaterialPropertyTransform(normalization_type=normalization_type)
-
-        if normalization_type == "log_minmax":
-            transform.E_min = math.log10(params["E_min"])
-            transform.E_max = math.log10(params["E_max"])
-            transform.nu_min = params["nu_min"]
-            transform.nu_max = params["nu_max"]
-            transform.rho_min = math.log10(params["rho_min"])
-            transform.rho_max = math.log10(params["rho_max"])
-            transform._stats_computed = True
-
-        return transform
+        return MaterialPropertyTransform.from_json(
+            normalization_params_file, normalization_type
+        )
 
     @staticmethod
     def _load_geometry_models(
@@ -714,25 +654,27 @@ class Vomp(nn.Module):
         return geometry_encoder, decoder
 
     @staticmethod
-    def _load_matvae(cfg: edict, device: torch.device) -> TripletVAE:
+    def _load_matvae(cfg: edict, device: torch.device) -> nn.Module:
         """
         Initialize and load pre-trained MatVAE model.
 
-        Creates a TripletVAE instance from configuration and loads pre-trained
+        Creates the MatVAE class selected by the JSON and loads pre-trained
         weights from a safetensors checkpoint file. The MatVAE handles encoding
         and decoding of material properties (Young's modulus, Poisson's ratio, density).
 
         Args:
             cfg: Configuration object containing:
+                - models.matvae.name: StandardVAE or TripletVAE
                 - models.matvae.args: MatVAE model architecture arguments
                 - matvae_checkpoint: Path to .safetensors checkpoint file
             device: Target device for model placement
 
         Returns:
-            Loaded TripletVAE model ready for inference
+            Loaded MatVAE model of the configured class
 
         Raises:
-            RuntimeError: If model initialization or checkpoint loading fails
+            ValueError: If the JSON does not name a supported MatVAE class
+            RuntimeError: If checkpoint loading fails
             FileNotFoundError: If checkpoint file doesn't exist
 
         Note:
@@ -741,10 +683,8 @@ class Vomp(nn.Module):
             - Checkpoint loading is strict (all parameters must match)
             - MatVAE weights are typically frozen during geometry encoder training
         """
-        try:
-            matvae = TripletVAE(**cfg.models.matvae.args).to(device)
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize MatVAE model: {e}")
+
+        matvae = material_vae.from_config(cfg.models.matvae).to(device)
 
         if cfg.get("matvae_checkpoint") is not None:
             if not os.path.exists(cfg.matvae_checkpoint):
@@ -801,13 +741,32 @@ class Vomp(nn.Module):
 
         return self
 
+    def _input_dimensions(self) -> Tuple[int, int]:
+        """Read the encoder's configured voxel resolution and feature width."""
+        args = self.config.get("models", {}).get("geometry_encoder", {}).get("args", {})
+        resolution = int(args.get("resolution", getattr(self.geometry_encoder, "resolution", 64)))
+        channels = int(args.get("in_channels", getattr(self.geometry_encoder, "in_channels", 1024)))
+        if resolution <= 0 or channels <= 0:
+            raise ValueError("Encoder resolution and in_channels must be positive")
+        return resolution, channels
+
+    def _require_preprocessing_dimensions(self) -> None:
+        """Built-in DINO preprocessing produces the released 64³/1024 contract."""
+        if self._input_dimensions() != (64, 1024):
+            raise ValueError(
+                "Built-in preprocessing requires resolution=64 and in_channels=1024; "
+                "use predict_materials with matching precomputed features for other encoders"
+            )
+
     @torch.inference_mode()
     def predict_materials(
         self,
         coords: torch.Tensor,
         features: torch.Tensor,
-        max_voxels: int = 32000,
+        max_voxels: int = 32768,
         sample_posterior: bool = False,
+        sampling_seed: int = DEFAULT_CAMERA_SEED,
+        segment_ids: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Predict material properties for given coordinates and features.
@@ -818,42 +777,61 @@ class Vomp(nn.Module):
 
         Args:
             coords: Voxel coordinates tensor (N, 4) in format [batch_idx, x, y, z]
-                where coordinates are normalized to [-0.5, 0.5] range
+                with integer spatial indices in [0, resolution - 1]
             features: DINO feature vectors (N, feature_dim) extracted from rendered views
             max_voxels: Maximum number of voxels to process at once. If input exceeds
-                this, random downsampling is applied to manage GPU memory usage
+                this, the training loader's segment-balanced sampling is applied
             sample_posterior: Whether to sample from VAE posterior distribution instead
                 of using mean predictions for more diverse outputs
+            sampling_seed: CPU sampling seed; use the same seed across checkpoints
+            segment_ids: Optional per-row material segment IDs from preprocessing
 
         Returns:
             Dictionary containing:
             - 'youngs_modulus': Young's modulus values in Pascals (N,)
             - 'poisson_ratio': Poisson's ratio values (N,)
             - 'density': Density values in kg/m³ (N,)
-            - 'voxel_coords_world': World space coordinates (N, 3)
+            - 'voxel_coords_world': Normalized model-frame cell centers (N, 3)
             - 'num_voxels': Total number of processed voxels
 
         Note:
             All predictions are automatically denormalized using the loaded
             normalization parameters to return physically meaningful values.
         """
+
+        resolution, channels = self._input_dimensions()
+        if coords.ndim != 2 or coords.shape[1] != 4 or not len(coords):
+            raise ValueError("coords must be a nonempty N x 4 integer tensor")
+        if coords.is_floating_point() or torch.any(coords[:, 1:] < 0) or torch.any(coords[:, 1:] >= resolution):
+            raise ValueError(f"coords must contain integer {resolution}^3 grid indices")
+        if features.shape != (len(coords), channels) or not torch.isfinite(features).all():
+            raise ValueError(f"features must be finite N x {channels} encoder inputs")
+        if max_voxels is None:
+            max_voxels = 32768
+        if not 0 < max_voxels <= 32768:
+            raise ValueError("max_voxels must be between 1 and the training cap 32768")
+        if segment_ids is None:
+            segment_ids = np.full(len(coords), "object")
+        segment_ids = np.asarray(segment_ids).astype(str)
+        if segment_ids.shape != (len(coords),):
+            raise ValueError("segment_ids must have one entry per feature row")
         device = next(self.parameters()).device
-        coords = coords.to(device)
-        features = features.to(device)
+        coords = coords.to(device=device, dtype=torch.int32)
+        features = features.to(device=device, dtype=torch.float32)
 
         # Downsample if too many voxels
         num_voxels = coords.shape[0]
         if num_voxels > max_voxels:
             print(f"Downsampling from {num_voxels} to {max_voxels} voxels")
-            indices = torch.randperm(num_voxels)[:max_voxels]
+            generator = torch.Generator(device="cpu").manual_seed(sampling_seed)
+            rows = _segment_balanced_random_rows(segment_ids, max_voxels, generator)
+            indices = torch.as_tensor(rows, dtype=torch.long, device=device)
             coords = coords[indices]
             features = features[indices]
             num_voxels = max_voxels
 
         # Create sparse tensor
-        sparse_tensor = SparseTensor(
-            feats=features, coords=coords, shape=(1, 64, 64, 64)
-        )
+        sparse_tensor = SparseTensor(feats=features, coords=coords)
 
         print(f"Running inference on {num_voxels} voxels...")
 
@@ -910,7 +888,7 @@ class Vomp(nn.Module):
 
         # Calculate world coordinates
         voxel_indices = coords[:, 1:].cpu().numpy()
-        voxel_coords_world = (voxel_indices + 0.5) / 64 - 0.5
+        voxel_coords_world = (voxel_indices + 0.5) / resolution - 0.5
 
         return {
             "youngs_modulus": E_values,
@@ -962,6 +940,7 @@ class Vomp(nn.Module):
         Returns:
             Dictionary containing raw model outputs
         """
+
         device = self.device
         coords = coords.to(device)
         features = features.to(device)
@@ -976,7 +955,7 @@ class Vomp(nn.Module):
 
         # Create sparse tensor
         sparse_tensor = SparseTensor(
-            feats=features, coords=coords, shape=(1, 64, 64, 64)
+            feats=features, coords=coords
         )
 
         # Forward pass through geometry encoder
@@ -1112,7 +1091,7 @@ class Vomp(nn.Module):
             # Stack and normalize
             materials = torch.stack([E, nu, rho], dim=-1)
             materials_normalized = (
-                self.material_transform.standardize_and_transform_tensor(materials)
+                self.material_transform.forward_transform_and_standardize_tensor(materials)
             )
             E, nu, rho = (
                 materials_normalized[:, 0],
@@ -1122,7 +1101,7 @@ class Vomp(nn.Module):
 
         # Encode through MatVAE
         material_tensor = torch.stack([E, nu, rho], dim=-1)
-        latent_mean, latent_logvar = self.matvae.encode(material_tensor)
+        _, latent_mean, _ = self.matvae.encode(material_tensor, sample=False)
 
         return latent_mean
 
@@ -1140,6 +1119,7 @@ class Vomp(nn.Module):
         image_size: int = 518,
         output_dir: Optional[str] = None,
         save_features: bool = True,
+        render_image_size: int = 512,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1157,7 +1137,8 @@ class Vomp(nn.Module):
             num_views: Number of camera views for rendering
             model_name: DINO model identifier
             batch_size: Feature extraction batch size
-            image_size: Render target image size
+            image_size: DINO input size (518), after the training RGBA resize
+            render_image_size: Render resolution (512), passed to render_func
             output_dir: Directory for intermediate files
             save_features: Whether to cache features to disk
             **kwargs: Additional arguments for custom functions
@@ -1170,6 +1151,8 @@ class Vomp(nn.Module):
         Raises:
             ValueError: If required inputs are missing for chosen workflow
         """
+        self._require_preprocessing_dimensions()
+
         if output_dir is None:
             output_dir = "/tmp/Vomp_features"
         os.makedirs(output_dir, exist_ok=True)
@@ -1184,7 +1167,7 @@ class Vomp(nn.Module):
                     )
                 print("Using custom rendering function...")
                 renders_metadata = render_func(
-                    obj_3d, output_dir, num_views, image_size, **kwargs
+                    obj_3d, output_dir, num_views, render_image_size, **kwargs
                 )
             else:
                 # Try to load existing renders metadata
@@ -1250,7 +1233,7 @@ class Vomp(nn.Module):
             num_views: Number of camera viewpoints to generate
             radius: Distance from object center to camera positions
             fov: Field of view in degrees for all cameras
-            seed: Random seed for reproducible sampling. If None, uses random offset
+            seed: Optional sampling seed; defaults to 0
 
         Returns:
             Tuple containing:
@@ -1259,12 +1242,10 @@ class Vomp(nn.Module):
                 - radius_list: List of camera distances (all same value)
                 - fov_list: List of FOV values in degrees (all same value)
         """
-        if seed is not None:
-            np.random.seed(seed)
-
+        rng = np.random.RandomState(DEFAULT_CAMERA_SEED if seed is None else seed)
         yaws = []
         pitchs = []
-        offset = (np.random.rand(), np.random.rand())
+        offset = (rng.rand(), rng.rand())
 
         # Prime numbers for Halton sequence generation
         PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
@@ -1311,10 +1292,12 @@ class Vomp(nn.Module):
         gaussian_model: "Gaussian",
         output_dir: str,
         num_views: int = 150,
-        image_size: int = 518,
-        radius: float = 2.0,
+        image_size: int = 512,
+        radius: Optional[float] = None,
         fov: float = 40.0,
         seed: Optional[int] = None,
+        asset_id: Optional[str] = None,
+        up_axis: str = "Z",
     ) -> List[Dict]:
         """
         Render multiple views of Gaussian splat from sampled camera positions.
@@ -1324,13 +1307,14 @@ class Vomp(nn.Module):
         camera metadata in NeRF-compatible format.
 
         Args:
-            gaussian_model: Gaussian splat model to render
+            gaussian_model: Gaussian splat normalized with _normalize_gaussian
             output_dir: Directory to save rendered images and metadata
             num_views: Number of camera views to render
             image_size: Resolution of rendered images (square)
-            radius: Camera distance from object center
+            radius: Optional minimum camera distance; defaults to training camera fitting
             fov: Field of view in degrees
-            seed: Random seed for reproducible camera sampling
+            seed: Optional camera seed override; defaults to 0
+            asset_id: Optional asset identity, used when seed is not supplied
 
         Returns:
             List of frame metadata dictionaries containing:
@@ -1339,57 +1323,113 @@ class Vomp(nn.Module):
                 - camera_angle_x: FOV in radians
                 - yaw, pitch, radius: Camera positioning parameters
         """
+        self._require_preprocessing_dimensions()
+
+        if num_views != camera.DEFAULT_NUM_VIEWS:
+            raise ValueError(
+                f"splat inference requires {camera.DEFAULT_NUM_VIEWS} views"
+            )
+        if image_size != camera.RESOLUTION:
+            raise ValueError(
+                f"splat inference requires {camera.RESOLUTION}px renders"
+            )
+        if not math.isclose(
+            math.radians(fov), camera.CAMERA_FOV, abs_tol=1.0e-12
+        ):
+            raise ValueError("splat inference requires the training 40-degree FOV")
+
+        up_axis = up_axis.upper()
+        if up_axis not in {"Y", "Z"}:
+            raise ValueError("up_axis must be 'Y' or 'Z'")
+
         renders_dir = os.path.join(output_dir, "renders")
         os.makedirs(renders_dir, exist_ok=True)
 
         print(f"Rendering {num_views} Gaussian splat views...")
-
-        # Sample camera views using shared utility
-        yaws, pitchs, radius_list, fov_list = self._sample_camera_views(
-            num_views, radius, fov, seed
+        gaussian_xyz = gaussian_model.get_xyz
+        gaussian_scales = gaussian_model.get_scaling
+        visible_support = gaussian_model.get_opacity.reshape(-1) >= 0.05
+        if not torch.any(visible_support):
+            raise ValueError("Gaussian splat has no visible support")
+        support_radius = 3.0 * gaussian_scales[visible_support].max(dim=1).values
+        support_xyz = gaussian_xyz[visible_support]
+        support_minimum = (support_xyz - support_radius[:, None]).amin(dim=0)
+        support_maximum = (support_xyz + support_radius[:, None]).amax(dim=0)
+        support_corners = torch.stack(
+            [
+                torch.stack((x, y, z))
+                for x in (support_minimum[0], support_maximum[0])
+                for y in (support_minimum[1], support_maximum[1])
+                for z in (support_minimum[2], support_maximum[2])
+            ]
         )
-
-        # Generate camera extrinsics and intrinsics matrices
-        extrinsics_list, intrinsics_list = yaw_pitch_r_fov_to_extrinsics_intrinsics(
-            yaws, pitchs, radius_list, fov_list
+        normalized_points = torch.cat((support_xyz, support_corners), dim=0)
+        normalized_points = normalized_points.detach().cpu().numpy().astype(np.float64)
+        camera_id = resolve_camera_id(
+            asset_id=asset_id, seed=seed,
         )
-
+        fov_radians = camera.CAMERA_FOV
+        focal = 0.5 * image_size / math.tan(fov_radians * 0.5)
+        intrinsics = torch.tensor(
+            (
+                (focal, 0.0, image_size * 0.5),
+                (0.0, focal, image_size * 0.5),
+                (0.0, 0.0, 1.0),
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        means = gaussian_xyz
+        quaternions = gaussian_model.get_rotation
+        scales = gaussian_scales
+        opacities = gaussian_model.get_opacity.reshape(-1)
+        colors = gaussian_model.get_features
         frames_metadata = []
-        for i, (extrinsics, intrinsics) in enumerate(
-            zip(extrinsics_list, intrinsics_list)
+        for i, yaw, pitch, direction in camera._camera_samples(
+            camera_id, num_views, up_axis
         ):
-            # Create camera configuration for rendering
-            fovx = 2 * torch.atan(0.5 / intrinsics[0, 0])
-            fovy = 2 * torch.atan(0.5 / intrinsics[1, 1])
-            camera_center = torch.inverse(extrinsics)[:3, 3]
-
-            camera = edict(
-                {
-                    "image_height": image_size,
-                    "image_width": image_size,
-                    "FoVx": fovx,
-                    "FoVy": fovy,
-                    "znear": 0.1,
-                    "zfar": 100.0,
-                    "world_view_transform": extrinsics.T.contiguous(),
-                    "projection_matrix": torch.eye(4, device=self.device),
-                    "full_proj_transform": extrinsics.T.contiguous(),
-                    "camera_center": camera_center,
-                }
+            horizontal, vertical = camera._camera_frame(direction, up_axis)
+            fitted_radius = camera._camera_radius(
+                normalized_points, direction, horizontal, vertical
             )
-
-            # Render the Gaussian splat
-            bg_color = torch.tensor(
-                [1.0, 1.0, 1.0], dtype=torch.float32, device=self.device
+            view_radius = fitted_radius if radius is None else max(radius, fitted_radius)
+            location = direction * view_radius
+            camera_to_world = np.asarray(
+                (
+                    (horizontal[0], vertical[0], direction[0], location[0]),
+                    (horizontal[1], vertical[1], direction[1], location[1]),
+                    (horizontal[2], vertical[2], direction[2], location[2]),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+                dtype=np.float32,
             )
-            with torch.inference_mode():
-                render_result = self._simple_render(
-                    gaussian_model, camera, bg_color, render_alpha=True
-                )
-                rendered_rgb = render_result["render"]
-                rendered_alpha = render_result.get(
-                    "alpha", torch.ones_like(rendered_rgb[:1])
-                )
+            camera_to_world_cv = camera_to_world.copy()
+            camera_to_world_cv[:3, 1:3] *= -1
+            extrinsics = torch.inverse(
+                torch.from_numpy(camera_to_world_cv).to(self.device)
+            )
+            rendered, alpha, _ = rasterization(
+                means=means,
+                quats=quaternions,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=extrinsics.unsqueeze(0),
+                Ks=intrinsics.unsqueeze(0),
+                width=image_size,
+                height=image_size,
+                near_plane=1.0e-4,
+                far_plane=8.0,
+                sh_degree=gaussian_model.active_sh_degree,
+                render_mode="RGB",
+            )
+            premultiplied_rgb = rendered[0].permute(2, 0, 1)
+            rendered_alpha = alpha[0].permute(2, 0, 1).clamp(0.0, 1.0)
+            rendered_rgb = torch.where(
+                rendered_alpha > 1.0e-6,
+                premultiplied_rgb / rendered_alpha.clamp_min(1.0e-6),
+                torch.zeros_like(premultiplied_rgb),
+            ).clamp(0.0, 1.0)
 
             # Combine RGB and alpha channels
             rendered_rgba = torch.cat([rendered_rgb, rendered_alpha], dim=0)
@@ -1398,27 +1438,33 @@ class Vomp(nn.Module):
             rendered_rgba = np.clip(rendered_rgba * 255, 0, 255).astype(np.uint8)
 
             # Save rendered image
-            filename = f"{i:04d}.png"
+            filename = f"{i:03d}.png"
             image_path = os.path.join(renders_dir, filename)
             Image.fromarray(rendered_rgba, "RGBA").save(image_path)
 
-            # Create camera-to-world transform matrix for metadata
-            c2w = torch.inverse(extrinsics).cpu().numpy()
-            c2w[:3, 1:3] *= -1
-
             frame_metadata = {
                 "file_path": filename,
-                "transform_matrix": c2w.tolist(),
-                "camera_angle_x": np.radians(fov),
-                "yaw": yaws[i],
-                "pitch": pitchs[i],
-                "radius": radius,
+                "transform_matrix": camera_to_world.astype(float).tolist(),
+                "camera_angle_x": fov_radians,
+                "yaw": yaw,
+                "pitch": pitch,
+                "radius": view_radius,
             }
             frames_metadata.append(frame_metadata)
 
         # Save NeRF-compatible transforms.json
         transforms_data = {
-            "camera_angle_x": np.radians(fov),
+            "camera_angle_x": fov_radians,
+            "asset_id": camera_id,
+            "render_settings": {
+                "num_views": num_views,
+                "resolution": image_size,
+                "field_of_view_radians": fov_radians,
+                "camera_nominal_radius": camera.CAMERA_NOMINAL_RADIUS,
+                "camera_fit_fraction": camera.CAMERA_FRAME_FRACTION,
+                "up_axis": up_axis,
+                "representation": "3d_gaussian_splat_sh",
+            },
             "frames": frames_metadata,
         }
 
@@ -1442,13 +1488,14 @@ class Vomp(nn.Module):
         num_views: int = 150,
         image_size: int = 518,
         render_image_size: int = 512,
-        radius: float = 2.0,
+        radius: Optional[float] = None,
         fov: float = 40.0,
         seed: Optional[int] = None,
+        up_axis: str = "Z",
         sh_degree: int = 3,
         aabb: Optional[List[float]] = None,
         device: Optional[Union[str, torch.device]] = None,
-        voxel_method: str = "centers",
+        voxel_method: str = "kaolin",
         voxel_level: int = 6,
         voxel_iso: float = 11.345,
         voxel_tol: float = 1.0 / 8.0,
@@ -1457,8 +1504,8 @@ class Vomp(nn.Module):
         max_voxels: Optional[int] = 32768,
         query_points: Union[str, np.ndarray, None] = "splat_centers",
         dino_batch_size: int = 16,
+        save_features: bool = True,
         return_original_scale: bool = True,
-        **kwargs: Any,
     ) -> Dict[str, np.ndarray]:
         """
         High-level API for Gaussian splat material property inference.
@@ -1475,12 +1522,15 @@ class Vomp(nn.Module):
             render_image_size: Resolution for rendering. Set to 512 to match training
                 data pipeline where images were rendered at 512x512 then resized to 518x518
                 for DINO feature extraction (default: 512)
-            radius: Camera distance from object center (default: 2.0, matches training data)
+            radius: Optional minimum camera distance (default: adaptive training camera fit)
             fov: Field of view in degrees (default: 40.0, matches training data)
-            seed: Random seed for camera view sampling
+            seed: Optional camera and voxel sampling seed override; defaults to 0
             sh_degree: Spherical harmonics degree for PLY loading
+            up_axis: Authored splat up-axis ("Z" or "Y")
+            return_original_scale: Return output coordinates in the authored splat frame.
+                Custom query_points arrays are always supplied in normalized coordinates.
             aabb: Bounding box for PLY loading (defaults to [-1,-1,-1,2,2,2])
-            device: Compute device (defaults to CUDA if available)
+            device: Compute device for PLY loading (defaults to the model device)
             voxel_method: Voxelization method ('centers' or 'kaolin')
                 - 'centers': Simple center-based voxelization (fast, less accurate)
                 - 'kaolin': Full Gaussian voxelization using kaolin (slower, more accurate)
@@ -1493,10 +1543,10 @@ class Vomp(nn.Module):
             query_points: Where to evaluate material properties. Can be:
                 - "splat_centers" (default): Evaluate at Gaussian splat centers
                 - "voxel_centers": Evaluate at voxel centers (original behavior)
-                - numpy array (N, 3): Custom 3D coordinates for evaluation
+                - numpy array (N, 3): Custom coordinates in the normalized [-0.5, 0.5] frame
                 - None: Same as "voxel_centers"
             dino_batch_size: Number of images to process simultaneously during DINO feature extraction (higher values use more GPU memory but may be faster)
-            **kwargs: Additional feature extraction arguments
+            save_features: Whether to cache extracted DINO features
 
         Returns:
             Dictionary containing material properties:
@@ -1516,20 +1566,27 @@ class Vomp(nn.Module):
             - 'voxel_coords_world': World coordinates of voxels
             - 'num_voxels': Number of voxels
         """
+        self._require_preprocessing_dimensions()
+
+
         # Handle automatic Gaussian loading from PLY path
         if isinstance(gaussian_model, str):
             # Set defaults
             if aabb is None:
                 aabb = [-1, -1, -1, 2, 2, 2]
             if device is None:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+                device = self.device
 
             # Create and load Gaussian
             ply_path = gaussian_model
             gaussian_model = Gaussian(sh_degree=sh_degree, aabb=aabb, device=device)
-            gaussian_model.load_ply(ply_path)
+            # Standard 3DGS PLYs do not declare an up-axis.  Preserve their
+            # authored coordinates; the default loader transform also leaves SH
+            # coefficients unrotated and therefore corrupts view-dependent color.
+            gaussian_model.load_ply(ply_path, transform=None)
         else:
             gaussian_model = copy.deepcopy(gaussian_model)
+        sampling_seed = DEFAULT_CAMERA_SEED if seed is None else int(seed)
 
         if output_dir is None:
             output_dir = f"/tmp/Vomp_splat_{id(gaussian_model)}"
@@ -1542,7 +1599,9 @@ class Vomp(nn.Module):
         ):
             # Filter kwargs to only pass render-related parameters
             render_kwargs = {
-                k: v for k, v in kwargs.items() if k in ["radius", "fov", "seed"]
+                k: v
+                for k, v in kwargs.items()
+                if k in ["radius", "fov", "seed", "asset_id", "up_axis"]
             }
             # Use render_image_size for actual rendering (default 512 to match training data)
             return self.render_sampled_views(
@@ -1556,13 +1615,12 @@ class Vomp(nn.Module):
         # Define built-in splat voxelization function
         def splat_voxelize_func(gaussian_model, output_dir, **kwargs):
             # Extract voxelization parameters from kwargs
-            voxel_method = kwargs.get("voxel_method", "centers")
+            voxel_method = kwargs.get("voxel_method", "kaolin")
             voxel_level = kwargs.get("voxel_level", 6)
             voxel_iso = kwargs.get("voxel_iso", 11.345)
             voxel_tol = kwargs.get("voxel_tol", 1.0 / 8.0)
             voxel_step = kwargs.get("voxel_step", 10)
             voxel_opacity_threshold = kwargs.get("voxel_opacity_threshold", 0.35)
-
             return self._voxelize_gaussian(
                 gaussian_model,
                 output_dir,
@@ -1577,11 +1635,11 @@ class Vomp(nn.Module):
         # Step 1: Extract features using built-in splat functions
         print("Step 1: Extracting features...")
 
-        _xyz0 = gaussian_model.get_xyz
-        _mn = _xyz0.min(dim=0)[0]
-        _mx = _xyz0.max(dim=0)[0]
-        _norm_center = ((_mn + _mx) / 2.0).detach().cpu().numpy()
-        _norm_scale = float((_mx - _mn).max().clamp(min=1e-8) / 0.98)
+        original_xyz = gaussian_model.get_xyz
+        source_min = original_xyz.amin(dim=0)
+        source_max = original_xyz.amax(dim=0)
+        source_center = ((source_min + source_max) * 0.5).detach().cpu().numpy()
+        source_scale = float((source_max - source_min).max())
 
         # Normalize Gaussian to standard coordinate system
         gaussian_model = self._normalize_gaussian(gaussian_model)
@@ -1601,6 +1659,7 @@ class Vomp(nn.Module):
             "radius": radius,
             "fov": fov,
             "seed": seed,
+            "up_axis": up_axis,
         }
 
         coords, features = self.get_features(
@@ -1613,7 +1672,7 @@ class Vomp(nn.Module):
             batch_size=dino_batch_size,
             **voxel_kwargs,
             **render_kwargs,
-            **kwargs,
+            save_features=save_features,
         )
 
         # Step 2: Run inference on the features
@@ -1621,6 +1680,8 @@ class Vomp(nn.Module):
         predict_kwargs = {}
         if max_voxels is not None:
             predict_kwargs["max_voxels"] = max_voxels
+        predict_kwargs["sampling_seed"] = sampling_seed
+        predict_kwargs["sample_posterior"] = False
         voxel_results = self.predict_materials(coords, features, **predict_kwargs)
 
         # Add splat count for reporting
@@ -1628,7 +1689,7 @@ class Vomp(nn.Module):
         voxel_results["num_splats"] = num_splats
 
         # Handle query_points parameter
-        if query_points == "splat_centers":
+        if isinstance(query_points, str) and query_points == "splat_centers":
             # Step 3: Evaluate materials at splat centers
             print("Step 3: Evaluating materials at splat centers...")
 
@@ -1664,7 +1725,9 @@ class Vomp(nn.Module):
             }
 
             print(f"✓ Evaluated materials at {num_splats:,} splat centers")
-        elif query_points == "voxel_centers" or query_points is None:
+        elif query_points is None or (
+            isinstance(query_points, str) and query_points == "voxel_centers"
+        ):
             # Return voxel-level results (original behavior)
             results = voxel_results
         elif isinstance(query_points, np.ndarray):
@@ -1709,17 +1772,16 @@ class Vomp(nn.Module):
             )
 
         if return_original_scale:
-            for _k in ("query_coords_world", "voxel_coords_world"):
-                if results.get(_k) is not None:
-                    results[_k] = denormalize_coords(
-                        np.asarray(results[_k], dtype=np.float64), _norm_center, _norm_scale
+            for key in ("query_coords_world", "voxel_coords_world"):
+                if results.get(key) is not None:
+                    results[key] = denormalize_coords(
+                        np.asarray(results[key], dtype=np.float64), source_center, source_scale
                     )
-            results["transform_center"] = _norm_center
-            results["transform_scale"] = _norm_scale
+            results["transform_center"] = source_center
+            results["transform_scale"] = source_scale
 
         print("✓ Material estimation complete!")
         return results
-
 
     @torch.inference_mode()
     def get_custom_materials(
@@ -1803,134 +1865,6 @@ class Vomp(nn.Module):
 
         return self._load_saved_features(features_path)
 
-    # Helper methods
-    @torch.inference_mode()
-    def _simple_render(
-        self, gaussian_model: "Gaussian", camera, bg_color, render_alpha=True
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Render single view of Gaussian splat using differentiable rasterization.
-
-        Core rendering function that rasterizes Gaussian splats to images using
-        GPU-accelerated splatting. Supports both RGB and alpha channel rendering
-        for proper transparency handling.
-
-        Args:
-            gaussian_model: Gaussian splat model containing positions, colors, etc.
-            camera: Camera configuration object with intrinsics and extrinsics
-            bg_color: Background color as 3D tensor [R, G, B]
-            render_alpha: Whether to compute alpha channel for transparency
-
-        Returns:
-            Dictionary containing render outputs:
-                - 'render': RGB image tensor (3, H, W)
-                - 'alpha': Alpha channel tensor (1, H, W) if render_alpha=True
-                - 'viewspace_points': Screen space points for gradients
-                - 'visibility_filter': Mask of visible Gaussians
-                - 'radii': Projected radii of Gaussians
-        """
-
-        # Initialize screen space points for gradients
-        screenspace_points = (
-            torch.zeros_like(
-                gaussian_model.get_xyz,
-                dtype=gaussian_model.get_xyz.dtype,
-                requires_grad=True,
-                device=self.device,
-            )
-            + 0
-        )
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
-
-        # Calculate FOV
-        tanfovx = math.tan(camera.FoVx * 0.5)
-        tanfovy = math.tan(camera.FoVy * 0.5)
-
-        # Rasterization settings
-        raster_settings = GaussianRasterizationSettings(
-            image_height=int(camera.image_height),
-            image_width=int(camera.image_width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg_color,
-            scale_modifier=1.0,
-            viewmatrix=camera.world_view_transform,
-            projmatrix=camera.full_proj_transform,
-            sh_degree=gaussian_model.active_sh_degree,
-            campos=camera.camera_center,
-            prefiltered=False,
-            debug=False,
-        )
-
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-        means3D = gaussian_model.get_xyz
-        means2D = screenspace_points
-        opacity = gaussian_model.get_opacity
-        scales = gaussian_model.get_scaling
-        rotations = gaussian_model.get_rotation
-        shs = gaussian_model.get_features
-
-        # Render with background color
-        rendered_rgb, radii = rasterizer(
-            means3D=means3D,
-            means2D=means2D,
-            shs=shs,
-            colors_precomp=None,
-            opacities=opacity,
-            scales=scales,
-            rotations=rotations,
-            cov3D_precomp=None,
-        )
-
-        result = {
-            "render": rendered_rgb,
-            "viewspace_points": screenspace_points,
-            "visibility_filter": radii > 0,
-            "radii": radii,
-        }
-
-        if render_alpha:
-            # Render with black background to compute alpha channel
-            black_bg = torch.zeros(3, dtype=torch.float32, device=self.device)
-            raster_settings_black = GaussianRasterizationSettings(
-                image_height=int(camera.image_height),
-                image_width=int(camera.image_width),
-                tanfovx=tanfovx,
-                tanfovy=tanfovy,
-                bg=black_bg,
-                scale_modifier=1.0,
-                viewmatrix=camera.world_view_transform,
-                projmatrix=camera.full_proj_transform,
-                sh_degree=gaussian_model.active_sh_degree,
-                campos=camera.camera_center,
-                prefiltered=False,
-                debug=False,
-            )
-
-            rasterizer_black = GaussianRasterizer(raster_settings=raster_settings_black)
-            rendered_black, _ = rasterizer_black(
-                means3D=means3D,
-                means2D=means2D,
-                shs=shs,
-                colors_precomp=None,
-                opacities=opacity,
-                scales=scales,
-                rotations=rotations,
-                cov3D_precomp=None,
-            )
-
-            # Compute alpha from difference between white and black backgrounds
-            alpha = 1.0 - (rendered_rgb - rendered_black).mean(dim=0, keepdim=True)
-            alpha = torch.clamp(alpha, 0.0, 1.0)
-
-            result["alpha"] = alpha
-
-        return result
-
     def _normalize_gaussian(self, gaussian_model: "Gaussian") -> "Gaussian":
         """
         Normalize Gaussian splat to standard coordinate system.
@@ -1950,7 +1884,12 @@ class Vomp(nn.Module):
         max_vals = xyz.max(dim=0, keepdim=True)[0]
         center = (min_vals + max_vals) / 2
         extent = (max_vals - min_vals).max()
-        scale_factor = 0.98 / extent
+        if not torch.isfinite(extent) or extent <= 0:
+            raise ValueError("Gaussian splat bounds are degenerate")
+        # Match material-object preprocessing exactly: center the axis-aligned
+        # bounds and divide by their maximum extent.  Do not add an extra 0.98
+        # margin; camera fitting is responsible for keeping the object in frame.
+        scale_factor = 1.0 / extent
 
         normalized_xyz = (xyz - center) * scale_factor
         normalized_scaling = gaussian_model.get_scaling * scale_factor
@@ -2040,9 +1979,10 @@ class Vomp(nn.Module):
         voxel_indices = ((centers + 0.5) * 64).astype(np.int32)
         voxel_indices = np.clip(voxel_indices, 0, 63)
 
-        # Unique voxel indices, then convert back to world-space voxel centers.
+        # Unique voxel indices, then convert back to world-space voxel centers
         unique_indices = np.unique(voxel_indices, axis=0)
-        voxel_centers = (unique_indices.astype(np.float32) + 0.5) / 64.0 - 0.5
+        voxel_centers = (unique_indices.astype(np.float64) + 0.5) / 64.0 - 0.5
+        voxel_centers = voxel_centers.astype(np.float32)
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
@@ -2082,11 +2022,18 @@ class Vomp(nn.Module):
 
         Note: Slower but recommended for accurate material prediction
         """
+
+        if level != 6:
+            raise ValueError("material inference requires a 64^3 (level 6) grid")
+
         # Extract Gaussian parameters
-        xyz = gaussian_model.get_xyz  # (N, 3)
-        scales = gaussian_model.get_scaling  # (N, 3)
-        rots = gaussian_model.get_rotation  # (N, 4) quaternions
-        opacities = gaussian_model.get_opacity  # (N,)
+        # Kaolin's grid covers [-1, 1], whereas the material model uses
+        # [-0.5, 0.5].  Scale both centers and Gaussian sizes into Kaolin's
+        # domain, then map its integer cells back below.
+        xyz = (gaussian_model.get_xyz * 2.0).contiguous()  # (N, 3)
+        scales = (gaussian_model.get_scaling * 2.0).contiguous()  # (N, 3)
+        rots = gaussian_model.get_rotation.contiguous()  # (N, 4) quaternions
+        opacities = gaussian_model.get_opacity.reshape(-1).contiguous()  # (N,)
 
         # Handle empty case
         if xyz.shape[0] == 0:
@@ -2096,12 +2043,8 @@ class Vomp(nn.Module):
         print(f"Using Kaolin voxelization with {xyz.shape[0]} Gaussians...")
         print(f"Resolution: {2**level}^3, opacity_threshold: {opacity_threshold}")
 
-        # gs_to_voxelgrid builds a kaolin SPC, which is defined on the [-1, 1] cube.
-        # The gaussian is normalized to [-0.5, 0.5], so scale positions (and the
-        # gaussian scales) by 2 to fill the full 2^level grid.
-        xyz = xyz * 2
-        scales = scales * 2
-
+        # Keep Kaolin's opacity integration (including step) intact.  The private
+        # gs_to_spc_cuda operator only produces intersections, not voxel opacity.
         # Use Kaolin's Gaussian to voxel grid conversion
         voxel_coords, voxel_opacities = gs_ops.gs_to_voxelgrid(
             xyz, scales, rots, opacities, level=level, iso=iso, tol=tol, step=step
@@ -2119,9 +2062,12 @@ class Vomp(nn.Module):
             )
             return np.empty((0, 3), dtype=np.float32)
 
-        # Convert voxel coordinates to world space centers.
+        # Convert voxel coordinates to world space centers
+        # Kaolin returns integer voxel coordinates, convert to world space [-0.5, 0.5]
         voxel_coords_cpu = voxel_coords.cpu().numpy()
-        voxel_centers = (voxel_coords_cpu.astype(np.float32) + 0.5) / (2**level) - 0.5
+        voxel_centers = (
+            (voxel_coords_cpu.astype(np.float64) + 0.5) / (2**level) - 0.5
+        ).astype(np.float32)
 
         # Save as PLY for compatibility
         voxel_path = os.path.join(voxels_dir, "voxels.ply")
@@ -2185,179 +2131,138 @@ class Vomp(nn.Module):
         image_size: int = 518,
         save_features: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract visual features from rendered images using DINO vision transformer.
+        """Extract voxel DINO features using the training preprocessing."""
 
-        Projects voxel positions to image coordinates across multiple views and
-        samples DINO patch features at those locations. Features are aggregated
-        across views to create robust visual representations for each voxel.
+        if model_name != DINO_MODEL:
+            raise ValueError(f"The material model uses {DINO_MODEL}")
+        if image_size != IMAGE_SIZE:
+            raise ValueError(f"DINO inputs must use the training size {IMAGE_SIZE}")
+        voxel_centers = np.asarray(voxel_centers, dtype=np.float32)
+        if voxel_centers.ndim != 2 or voxel_centers.shape[1] != 3 or not len(
+            voxel_centers
+        ):
+            raise ValueError("voxel centers must be a nonempty N x 3 array")
+        indices = np.floor(
+            (voxel_centers.astype(np.float64) + 0.5) * 64.0
+        ).astype(np.int64)
+        expected_centers = (
+            (indices.astype(np.float64) + 0.5) / 64.0 - 0.5
+        ).astype(np.float32)
+        if (
+            np.any(indices < 0)
+            or np.any(indices >= 64)
+            or not np.array_equal(voxel_centers, expected_centers)
+            or len(np.unique(np.ravel_multi_index(indices.T, (64, 64, 64))))
+            != len(indices)
+        ):
+            raise ValueError("voxels are not unique exact 64^3 cell centers")
 
-        Args:
-            output_dir: Directory containing rendered images and to save features
-            voxel_centers: 3D positions of voxels in world coordinates (N, 3)
-            frames_metadata: List of frame info with camera transforms and paths
-            model_name: DINO model variant to use for feature extraction
-            batch_size: Number of images to process simultaneously
-            image_size: Expected size of input images (assumed square)
-            save_features: Whether to cache extracted features to disk
+        occupancy = np.zeros((64, 64, 64), dtype=bool)
+        occupancy[tuple(indices.T)] = True
+        interior = occupancy.copy()
+        for axis in range(3):
+            forward = np.zeros_like(occupancy)
+            backward = np.zeros_like(occupancy)
+            source = [slice(None)] * 3
+            destination = [slice(None)] * 3
+            source[axis] = slice(1, None)
+            destination[axis] = slice(None, -1)
+            forward[tuple(destination)] = occupancy[tuple(source)]
+            source[axis] = slice(None, -1)
+            destination[axis] = slice(1, None)
+            backward[tuple(destination)] = occupancy[tuple(source)]
+            interior &= forward & backward
+        surface_mask = ~interior[tuple(indices.T)]
+        segment_ids = np.full(len(indices), "splat", dtype="U5")
+        segment_order = ("splat",)
+        metadata_path = os.path.join(output_dir, "voxels", "voxel_metadata.npz")
+        if os.path.isfile(metadata_path):
+            with np.load(metadata_path, allow_pickle=False) as metadata:
+                if not np.array_equal(metadata["indices"], indices):
+                    raise ValueError("voxel metadata does not match these voxel centers; use a fresh output_dir")
+                surface_mask = metadata["surface_mask"].astype(bool)
+                segment_ids = metadata["segment_ids"].astype(str)
+                segment_order = (
+                    tuple(metadata["segment_order"].astype(str))
+                    if "segment_order" in metadata else tuple(np.unique(segment_ids))
+                )
+            if surface_mask.shape != (len(indices),) or segment_ids.shape != (len(indices),):
+                raise ValueError("voxel metadata must contain one surface/segment label per voxel")
+        selected_rows = sample_voxel_rows(
+            indices,
+            segment_ids,
+            surface_mask,
+            segment_order,
+            MAX_DINO_VOXELS,
+        )
+        indices = indices[selected_rows]
+        positions = voxel_centers[selected_rows]
+        segment_ids = segment_ids[selected_rows]
 
-        Returns:
-            Tuple of (coordinates, features):
-                - coordinates: Voxel indices in sparse tensor format (N, 4)
-                - features: Aggregated DINO features per voxel (N, feature_dim)
-        """
-
-        # Create features directory
         features_dir = os.path.join(output_dir, "features")
         os.makedirs(features_dir, exist_ok=True)
         features_path = os.path.join(features_dir, f"{model_name}.npz")
-
-        # Try to load existing features first
+        render_sha256 = render_hash(os.path.join(output_dir, "renders"), frames_metadata)
         if os.path.exists(features_path):
-            print(f"Loading existing features from {features_path}")
-            return self._load_saved_features(features_path)
+            try:
+                with np.load(features_path, allow_pickle=False) as archive:
+                    aggregation = str(archive["feature_contract"].item())
+                    cached_indices = archive["indices"]
+                    patchtokens = archive["patchtokens"]
+                    cached_repository = str(archive["model_repository"].item())
+                    cached_render = str(archive["render_sha256"].item())
+                    cached_segments = archive["segment_ids"]
+                if (
+                    aggregation == "training_alpha_in_frame_weighted_v1"
+                    and cached_repository == DINO_REPOSITORY
+                    and cached_render == render_sha256
+                    and np.array_equal(cached_indices, indices.astype(np.uint8))
+                    and np.array_equal(cached_segments, segment_ids)
+                    and patchtokens.shape == (len(indices), 1024)
+                    and patchtokens.dtype == np.float16
+                    and np.isfinite(patchtokens).all()
+                ):
+                    print(f"Loading DINO features from {features_path}")
+                    return self._load_saved_features(features_path)
+            except (KeyError, OSError, ValueError):
+                pass
+            print(f"Ignoring stale feature cache: {features_path}")
 
-        print(f"Extracting new DINO features...")
-
-        # Initialize lazy DINO
-        dino = LazyLoadDino(
+        print("Extracting DINO features...")
+        dino = self._dino_loader(
             model_name=model_name, device=self.device, use_trt=self.use_trt
         )
-
-        # Convert voxel centers to tensor coordinates
-        positions = torch.from_numpy(voxel_centers).float().to(self.device)
-        indices = ((positions + 0.5) * 64).long()
-        indices = torch.clamp(indices, 0, 63)
-
-        # Convert to int32 for sparse tensor coordinates
-        indices = indices.int()
-
-        # Create coordinates tensor (batch_idx, x, y, z)
-        batch_dim = torch.zeros(
-            (indices.shape[0], 1), dtype=torch.int32, device=self.device
+        views = load_views_from_directory(
+            os.path.join(output_dir, "renders"), frames_metadata
         )
-        coords = torch.cat([batch_dim, indices], dim=1)
-
-        # Process rendered images
-        data = []
-        renders_dir = os.path.join(output_dir, "renders")
-
-        for frame in frames_metadata:
-            image_path = os.path.join(renders_dir, frame["file_path"])
-
-            if not os.path.exists(image_path):
-                continue
-
-            # Load and preprocess image
-            image = Image.open(image_path)
-            image = image.resize((image_size, image_size), Image.Resampling.LANCZOS)
-            image = np.array(image).astype(np.float32) / 255
-
-            if image.shape[2] == 4:
-                image = image[:, :, :3] * image[:, :, 3:]
-            else:
-                image = image[:, :, :3]
-
-            image = torch.from_numpy(image).permute(2, 0, 1).float()
-
-            # Camera matrices
-            c2w = torch.tensor(frame["transform_matrix"], dtype=torch.float32)
-            c2w[:3, 1:3] *= -1
-            extrinsics = torch.inverse(c2w)
-            fov = frame["camera_angle_x"]
-            intrinsics = utils3d.torch.intrinsics_from_fov_xy(
-                torch.tensor(fov, dtype=torch.float32),
-                torch.tensor(fov, dtype=torch.float32),
+        # The shared preprocessing uses .cuda(); select this model's CUDA device.
+        with torch.cuda.device(self.device):
+            patchtokens = extract_features(
+                dino.get_model(),
+                views,
+                positions,
+                dino.get_transform(),
+                batch_size,
+                8192,
             )
-
-            data.append(
-                {"image": image, "extrinsics": extrinsics, "intrinsics": intrinsics}
-            )
-
-        if len(data) == 0:
-            raise ValueError("No valid rendered images found")
-
-        # Apply transforms and extract features
-        transform = dino.get_transform()
-        for datum in data:
-            datum["image"] = transform(datum["image"])
-
-        n_patch = dino.n_patch
-        patchtokens_lst = []
-        uv_lst = []
-
-        # Process in batches
-        for i in range(0, len(data), batch_size):
-            batch_data = data[i : i + batch_size]
-            bs = len(batch_data)
-
-            batch_images = torch.stack([d["image"] for d in batch_data]).to(self.device)
-            batch_extrinsics = torch.stack([d["extrinsics"] for d in batch_data]).to(
-                self.device
-            )
-            batch_intrinsics = torch.stack([d["intrinsics"] for d in batch_data]).to(
-                self.device
-            )
-
-            # Extract DINO features
-            model = dino.get_model()
-            with torch.inference_mode():
-                features = model(batch_images, is_training=True)
-
-            # Project voxels to image coordinates
-            uv = (
-                utils3d.torch.project_cv(positions, batch_extrinsics, batch_intrinsics)[
-                    0
-                ]
-                * 2
-                - 1
-            )
-
-            # Get patch tokens
-            patchtokens = (
-                features["x_prenorm"][:, model.num_register_tokens + 1 :]
-                .permute(0, 2, 1)
-                .reshape(bs, 1024, n_patch, n_patch)
-            )
-
-            patchtokens_lst.append(patchtokens)
-            uv_lst.append(uv)
-
-        # Concatenate all features
-        patchtokens = torch.cat(patchtokens_lst, dim=0)
-        uv = torch.cat(uv_lst, dim=0)
-
-        # Sample features at voxel locations
-        with torch.inference_mode():
-            sampled_features = (
-                F.grid_sample(
-                    patchtokens,
-                    uv.unsqueeze(1),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                .squeeze(2)
-                .permute(0, 2, 1)
-            )
-
-        # Aggregate features across views: mean in float32, then cast to float16 for storage
-        arr = sampled_features.cpu().numpy()  # float32
-        arr_mean_f16 = np.mean(arr, axis=0).astype(np.float16)
-
-        # Save features to disk if requested
         if save_features:
             pack = {
-                "indices": indices.cpu().numpy().astype(np.uint8),
-                "patchtokens": arr_mean_f16,
+                "indices": indices.astype(np.uint8),
+                "patchtokens": patchtokens,
+                "voxel_row_indices": selected_rows.astype(np.int32),
+                "segment_ids": segment_ids,
+                "feature_contract": np.asarray("training_alpha_in_frame_weighted_v1"),
+                "model_repository": np.asarray(DINO_REPOSITORY),
+                "render_sha256": np.asarray(render_sha256),
             }
             np.savez_compressed(features_path, **pack)
             print(f"Saved features to {features_path}")
-            print(f"Feature shape: {pack['patchtokens'].shape}")
-            print(f"Voxel indices shape: {pack['indices'].shape}")
-
-        # Convert to float32 tensor for inference
-        features = torch.from_numpy(arr_mean_f16).to(self.device).float()
-
+        indices_tensor = torch.from_numpy(indices.astype(np.int32)).to(self.device)
+        batch_dim = torch.zeros(
+            (len(indices), 1), dtype=torch.int32, device=self.device
+        )
+        coords = torch.cat((batch_dim, indices_tensor), dim=1)
+        features = torch.from_numpy(patchtokens.astype(np.float32)).to(self.device)
         return coords, features
 
     def _load_saved_features(
@@ -2405,6 +2310,7 @@ class Vomp(nn.Module):
         voxel_results: Dict[str, np.ndarray],
     ) -> Dict[str, np.ndarray]:
         """Map voxel materials to closest splats"""
+
         # Get splat positions
         splat_positions = gaussian_model.get_xyz.detach().cpu().numpy()
 
@@ -2428,400 +2334,38 @@ class Vomp(nn.Module):
 
         return splat_materials
 
-    def _install_blender(self):
-        """Install Blender 3.0.1 for mesh rendering if not already present."""
-        BLENDER_LINK = "https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz"
-        BLENDER_INSTALLATION_PATH = "/tmp"
-        BLENDER_PATH = f"{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender"
-
-        if not os.path.exists(BLENDER_PATH):
-            print("Installing Blender...")
-            os.system("sudo apt-get update")
-            os.system(
-                "sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6"
-            )
-            os.system(f"wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}")
-            os.system(
-                f"tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}"
-            )
-            print(f"✓ Blender installed at: {BLENDER_PATH}")
-
-        return BLENDER_PATH
-
-    def _render_views_sequential(
-        self,
-        views: List[Dict],
-        mesh_path: str,
-        renders_dir: str,
-        image_size: int,
-        blender_path: str,
-        use_gpu: bool,
-        gpu_device: str,
-    ) -> List[Dict]:
-        """Render views sequentially using single Blender process."""
-        # Call Blender rendering script
-        args = [
-            blender_path,
-            "-b",
-            "-P",
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "dataset_toolkits",
-                "blender_script",
-                "render.py",
-            ),
-            "--",
-            "--views",
-            json.dumps(views),
-            "--object",
-            os.path.abspath(os.path.expanduser(mesh_path)),
-            "--resolution",
-            str(image_size),
-            "--output_folder",
-            renders_dir,
-            "--engine",
-            "CYCLES",
-            "--save_mesh",
-        ]
-
-        # Add GPU rendering arguments
-        if use_gpu:
-            args.extend(["--use_gpu", "--gpu_device", gpu_device])
-            print(f"✓ GPU rendering enabled: {gpu_device}")
-
-        if mesh_path.endswith(".blend"):
-            args.insert(1, mesh_path)
-
-        call(args, stdout=DEVNULL, stderr=DEVNULL)
-
-        # Load metadata
-        transforms_path = os.path.join(renders_dir, "transforms.json")
-        if os.path.exists(transforms_path):
-            with open(transforms_path, "r") as f:
-                transforms_data = json.load(f)
-            return transforms_data.get("frames", [])
-        else:
-            raise RuntimeError(
-                f"Blender did not create transforms.json at {transforms_path}"
-            )
-
-    def _render_views_parallel(
-        self,
-        views: List[Dict],
-        mesh_path: str,
-        renders_dir: str,
-        image_size: int,
-        blender_path: str,
-        use_gpu: bool,
-        gpu_device: str,
-        num_jobs: int,
-    ) -> List[Dict]:
-        """Render views in parallel using multiple Blender processes."""
-
-        # Split views into chunks for parallel processing
-        chunk_size = max(1, len(views) // num_jobs)
-        view_chunks = [
-            views[i : i + chunk_size] for i in range(0, len(views), chunk_size)
-        ]
-
-        print(
-            f"Splitting {len(views)} views into {len(view_chunks)} chunks (max {chunk_size} views per job)"
-        )
-
-        # Create temporary directories for each job
-        temp_dirs = []
-        for i in range(len(view_chunks)):
-            temp_dir = os.path.join(renders_dir, f"temp_job_{i}")
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_dirs.append(temp_dir)
-
-        # Create worker arguments with proper view indexing
-        worker_args = []
-        view_index_offset = 0
-        for i, (chunk, temp_dir) in enumerate(zip(view_chunks, temp_dirs)):
-            worker_args.append(
-                {
-                    "job_id": i,
-                    "views": chunk,
-                    "view_index_offset": view_index_offset,
-                    "mesh_path": mesh_path,
-                    "temp_dir": temp_dir,
-                    "image_size": image_size,
-                    "blender_path": blender_path,
-                    "use_gpu": use_gpu,
-                    "gpu_device": gpu_device,
-                    "render_script": os.path.join(
-                        os.path.dirname(__file__),
-                        "..",
-                        "..",
-                        "dataset_toolkits",
-                        "blender_script",
-                        "render.py",
-                    ),
-                }
-            )
-            view_index_offset += len(chunk)
-
-        # Run parallel rendering
-        with multiprocessing.Pool(processes=num_jobs) as pool:
-            results = pool.map(self._render_chunk_worker, worker_args)
-
-        # Merge results and rename files to avoid conflicts
-        all_frames = []
-        global_view_index = 0
-
-        for i, frames in enumerate(results):
-            if frames is None:
-                raise RuntimeError(f"Job {i} failed to render")
-
-            # Copy rendered images to main renders directory with correct global numbering
-            temp_dir = temp_dirs[i]
-            for j, frame in enumerate(frames):
-                # Original filename from job (e.g., "000.png", "001.png")
-                old_path = os.path.join(temp_dir, frame["file_path"])
-
-                # New filename with global indexing (e.g., "000.png", "038.png", "075.png")
-                new_filename = f"{global_view_index:03d}.png"
-                new_path = os.path.join(renders_dir, new_filename)
-
-                if os.path.exists(old_path):
-                    os.rename(old_path, new_path)
-                    # Update frame metadata with new filename
-                    frame["file_path"] = new_filename
-                else:
-                    print(f"Warning: Expected file not found: {old_path}")
-
-                global_view_index += 1
-
-            all_frames.extend(frames)
-
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # Save merged transforms.json
-        transforms_data = {
-            "camera_angle_x": views[0]["fov"] if views else 0.0,
-            "frames": all_frames,
-        }
-
-        transforms_path = os.path.join(renders_dir, "transforms.json")
-        with open(transforms_path, "w") as f:
-            json.dump(transforms_data, f, indent=2)
-
-        print(
-            f"✓ Merged {len(all_frames)} rendered views from {num_jobs} parallel jobs"
-        )
-        return all_frames
-
-    @staticmethod
-    def _render_chunk_worker(args):
-        """
-        Worker function for parallel mesh rendering using Blender.
-
-        Renders a subset of camera views in a separate Blender process as part
-        of parallel rendering pipeline. Each worker handles its assigned views
-        independently to improve throughput.
-
-        Args:
-            args: Dictionary containing worker configuration:
-                - job_id: Unique worker identifier for logging
-                - views: List of camera view parameters to render
-                - mesh_path: Path to input mesh file
-                - temp_dir: Temporary directory for this worker's output
-                - image_size: Target image resolution
-                - blender_path: Path to Blender executable
-                - use_gpu: Whether to use GPU acceleration
-                - gpu_device: GPU device type string
-                - render_script: Path to Blender rendering script
-
-        Returns:
-            List of frame metadata dictionaries for rendered views, or None on failure
-        """
-        job_id = args["job_id"]
-        views = args["views"]
-        mesh_path = args["mesh_path"]
-        temp_dir = args["temp_dir"]
-        image_size = args["image_size"]
-        blender_path = args["blender_path"]
-        use_gpu = args["use_gpu"]
-        gpu_device = args["gpu_device"]
-        render_script = args["render_script"]
-
-        print(f"  Job {job_id}: Rendering {len(views)} views...")
-
-        # Prepare Blender arguments
-        blender_args = [
-            blender_path,
-            "-b",
-            "-P",
-            render_script,
-            "--",
-            "--views",
-            json.dumps(views),
-            "--object",
-            os.path.expanduser(mesh_path),
-            "--resolution",
-            str(image_size),
-            "--output_folder",
-            temp_dir,
-            "--engine",
-            "CYCLES",
-        ]
-
-        # Add GPU rendering arguments
-        if use_gpu:
-            blender_args.extend(["--use_gpu", "--gpu_device", gpu_device])
-
-        if mesh_path.endswith(".blend"):
-            blender_args.insert(1, mesh_path)
-
-        try:
-            # Run Blender with error output to help debug
-
-            process = Popen(blender_args, stdout=PIPE, stderr=PIPE)
-            stdout, stderr = process.communicate()
-
-            if process.returncode != 0:
-                print(
-                    f"  Job {job_id}: Blender error - returncode {process.returncode}"
-                )
-                if stderr:
-                    print(f"  Job {job_id}: stderr: {stderr.decode()[:200]}...")
-                return None
-
-            # Load and return metadata
-            transforms_path = os.path.join(temp_dir, "transforms.json")
-            if os.path.exists(transforms_path):
-                with open(transforms_path, "r") as f:
-                    transforms_data = json.load(f)
-                frames = transforms_data.get("frames", [])
-                print(f"  Job {job_id}: ✓ Completed {len(frames)} views")
-                return frames
-            else:
-                print(f"  Job {job_id}: ✗ Failed - no transforms.json created")
-                print(
-                    f"  Job {job_id}: temp_dir contents: {os.listdir(temp_dir) if os.path.exists(temp_dir) else 'N/A'}"
-                )
-                return None
-
-        except Exception as e:
-            print(f"  Job {job_id}: ✗ Failed with error: {e}")
-            return None
-
     def render_mesh_views(
         self,
         mesh_path: str,
         output_dir: str,
         num_views: int = 150,
-        image_size: int = 518,
-        radius: float = 2.0,
+        image_size: int = 512,
+        radius: Optional[float] = None,
         fov: float = 40.0,
         seed: Optional[int] = None,
         blender_path: Optional[str] = None,
-        use_gpu: bool = True,
-        gpu_device: str = "OPTIX",
-        num_render_jobs: int = 1,
+        dataset: str = "simready",
     ) -> List[Dict]:
+        """Render the training 150-view, 512px Cycles setup and exact mesh geometry.
+
+        Uses adaptive camera distance, the production lights/world and Blender
+        4.2. With no blender_path, the current Python must provide bpy 4.2.
+        USD assets use the production USD material/geometry loader; other supported
+        inputs are GLB/GLTF, OBJ, PLY and STL. Parallelize across assets/GPUs.
+        Camera sampling defaults to seed 0; pass seed to override it.
         """
-        Render multiple views of mesh using Blender for photorealistic results.
+        self._require_preprocessing_dimensions()
 
-        Uses Blender's Cycles render engine to generate high-quality mesh renders
-        from sampled camera positions. Supports GPU acceleration and parallel
-        rendering for improved performance.
+        from dataset_toolkits.material_objects.render_mesh import render_mesh
 
-        Args:
-            mesh_path: Path to mesh file (OBJ, PLY, STL, blend, etc.)
-            output_dir: Directory to save rendered images and metadata
-            num_views: Number of camera viewpoints to render
-            image_size: Square image resolution in pixels
-            radius: Camera distance from object center
-            fov: Field of view angle in degrees
-            seed: Random seed for reproducible camera sampling
-            blender_path: Path to Blender executable (uses BLENDER_BIN env var if None)
-            use_gpu: Whether to enable GPU acceleration (CUDA/OptiX/OpenCL)
-            gpu_device: GPU compute device type for Blender
-            num_render_jobs: Number of parallel Blender processes
-
-        Returns:
-            List of frame metadata dictionaries with camera poses and file paths
-
-        Raises:
-            EnvironmentError: If Blender executable not found
-            FileNotFoundError: If mesh file doesn't exist
-            RuntimeError: If rendering process fails
-        """
-        renders_dir = os.path.join(output_dir, "renders")
-        os.makedirs(renders_dir, exist_ok=True)
-
-        # Determine Blender path
-        if blender_path is not None:
-            BLENDER_PATH = blender_path
-            if not os.path.exists(BLENDER_PATH):
-                raise FileNotFoundError(
-                    f"Blender executable not found at: {BLENDER_PATH}"
-                )
-        else:
-            # Try to get from environment variable
-            BLENDER_PATH = os.environ.get("BLENDER_BIN")
-            if BLENDER_PATH is None:
-                raise EnvironmentError(
-                    "No Blender path provided and BLENDER_BIN environment variable not set. "
-                    "Either provide blender_path parameter or set BLENDER_BIN environment variable. "
-                    "You can install Blender using the install_env.sh script."
-                )
-            if not os.path.exists(BLENDER_PATH):
-                raise FileNotFoundError(
-                    f"Blender executable not found at environment path: {BLENDER_PATH}. "
-                    "Please check your BLENDER_BIN environment variable or reinstall Blender using install_env.sh"
-                )
-
-        print(f"Rendering {num_views} mesh views with Blender...")
-
-        # Sample camera views using shared utility
-        yaws, pitchs, radius_list, fov_list = self._sample_camera_views(
-            num_views, radius, fov, seed
+        if num_views != 150 or image_size != 512 or fov != 40.0 or radius is not None:
+            raise ValueError(
+                "Training rendering requires num_views=150, image_size=512, "
+                "fov=40 and radius=None (adaptive distance)"
+            )
+        return render_mesh(
+            mesh_path, output_dir, blender_path=blender_path, seed=seed, dataset=dataset
         )
-
-        # Convert to Blender format
-        views = [
-            {"yaw": y, "pitch": p, "radius": r, "fov": f / 180 * np.pi}
-            for y, p, r, f in zip(yaws, pitchs, radius_list, fov_list)
-        ]
-
-        if num_render_jobs == 1:
-            # Sequential rendering (original behavior)
-            frames_metadata = self._render_views_sequential(
-                views,
-                mesh_path,
-                renders_dir,
-                image_size,
-                BLENDER_PATH,
-                use_gpu,
-                gpu_device,
-            )
-        else:
-            # Parallel rendering
-            print(f"Using {num_render_jobs} parallel Blender processes...")
-            frames_metadata = self._render_views_parallel(
-                views,
-                mesh_path,
-                renders_dir,
-                image_size,
-                BLENDER_PATH,
-                use_gpu,
-                gpu_device,
-                num_render_jobs,
-            )
-
-        # Save metadata for pipeline compatibility
-        metadata_path = os.path.join(output_dir, "renders_metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(frames_metadata, f, indent=2)
-
-        print(f"✓ Rendered {len(frames_metadata)} views")
-        return frames_metadata
 
     def render_views_replicator(
         self,
@@ -2952,87 +2496,17 @@ class Vomp(nn.Module):
         mesh_path: str,
         output_dir: str,
         voxel_size: float = 1 / 64,
-        max_voxels: Optional[int] = None,
     ) -> np.ndarray:
+        """Voxelize the geometry saved by render_mesh_views on the training grid.
+
+        Returns all occupied cell centers; feature extraction applies the 72k
+        surface/interior budget, then predict_materials applies the 32768 budget.
         """
-        Convert mesh geometry to discrete voxel representation.
+        from dataset_toolkits.material_objects.render_mesh import voxelize_render_geometry
 
-        Loads mesh file and generates voxel occupancy grid using trimesh
-        voxelization. Handles both single meshes and complex scenes with
-        multiple geometries. Normalizes to standard coordinate system.
-
-        Args:
-            mesh_path: Path to mesh file (supports OBJ, PLY, STL, etc.)
-            output_dir: Directory to save voxel PLY file
-            voxel_size: Voxel spacing in normalized coordinates (1/64 = 64³ grid)
-            max_voxels: Maximum voxels to generate; subsamples if exceeded
-
-        Returns:
-            Array of voxel center coordinates in world space (N, 3)
-        """
-        voxels_dir = os.path.join(output_dir, "voxels")
-        os.makedirs(voxels_dir, exist_ok=True)
-
-        print(f"Voxelizing mesh: {mesh_path}")
-
-        # Load and combine mesh geometry
-        mesh = trimesh.load(mesh_path)
-        if hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
-            vertices, faces = mesh.vertices, mesh.faces
-        else:
-            # Mesh scene - combine all geometries
-            vertices_list, faces_list = [], []
-            vertex_offset = 0
-            for geometry in mesh.geometry.values():
-                if hasattr(geometry, "vertices") and hasattr(geometry, "faces"):
-                    vertices_list.append(geometry.vertices)
-                    faces_list.append(geometry.faces + vertex_offset)
-                    vertex_offset += len(geometry.vertices)
-            if not vertices_list:
-                raise ValueError("No valid geometry found in mesh")
-            vertices, faces = np.vstack(vertices_list), np.vstack(faces_list)
-
-        # Step 1: Compute scale from original bbox
-        bbox_min, bbox_max = vertices.min(axis=0), vertices.max(axis=0)
-        bbox_size = (bbox_max - bbox_min).max()
-        blender_scale = 1 / bbox_size
-
-        # Step 2: Apply scale to vertices
-        vertices_scaled = vertices * blender_scale
-
-        # Step 3: Compute offset from SCALED bbox (this is what Blender does!)
-        bbox_min_scaled = vertices_scaled.min(axis=0)
-        bbox_max_scaled = vertices_scaled.max(axis=0)
-        blender_offset = -(bbox_min_scaled + bbox_max_scaled) / 2
-
-        # Step 4: Apply offset
-        vertices_normalized = vertices_scaled + blender_offset
-        vertices_normalized = np.clip(vertices_normalized, -0.5 + 1e-6, 0.5 - 1e-6)
-
-        # Now voxelize the normalized mesh
-        normalized_mesh = trimesh.Trimesh(vertices=vertices_normalized, faces=faces)
-        voxel_grid = normalized_mesh.voxelized(pitch=voxel_size).fill()
-        voxel_centers = voxel_grid.points
-
-        # Subsample if too many voxels
-        if max_voxels is not None and len(voxel_centers) > max_voxels:
-            print(f"Subsampling voxels: {len(voxel_centers):,} -> {max_voxels:,}")
-            np.random.seed(42)  # For reproducibility
-            indices = np.random.choice(len(voxel_centers), max_voxels, replace=False)
-            voxel_centers = voxel_centers[indices]
-
-        indices = ((voxel_centers + 0.5) * 64).astype(np.int64)
-        indices = np.clip(indices, 0, 63)
-        discretized_positions = indices.astype(np.float32) / 64.0 - 0.5
-
-        voxel_centers = discretized_positions
-
-        # Save as PLY for compatibility with existing pipeline
-        voxel_path = os.path.join(voxels_dir, "voxels.ply")
-        self._save_voxels_ply(voxel_centers, voxel_path)
-
-        print(f"Generated {len(voxel_centers)} voxels")
-        return voxel_centers
+        if voxel_size != 1 / 64:
+            raise ValueError("Mesh voxelization requires the training voxel_size=1/64")
+        return voxelize_render_geometry(mesh_path, output_dir)
 
     @torch.inference_mode()
     def get_mesh_materials(
@@ -3042,558 +2516,133 @@ class Vomp(nn.Module):
         num_views: int = 150,
         image_size: int = 518,
         render_image_size: int = 512,
-        radius: float = 2.0,
+        radius: Optional[float] = None,
         fov: float = 40.0,
         seed: Optional[int] = None,
         voxel_size: float = 1 / 64,
         max_voxels: Optional[int] = 32768,
         blender_path: Optional[str] = None,
         query_points: Union[str, np.ndarray, None] = "mesh_vertices",
-        use_gpu: bool = True,
-        gpu_device: str = "OPTIX",
-        num_render_jobs: int = 1,
         dino_batch_size: int = 16,
         return_original_scale: bool = False,
-        **kwargs: Any,
+        usd_dataset: str = "simready",
+        save_features: bool = True,
     ) -> Dict[str, np.ndarray]:
-        """
-        High-level API for mesh material property inference.
+        """Predict materials using the shared training preprocessing.
 
-        Args:
-            mesh_path: Path to mesh file
-            output_dir: Directory for intermediate files
-            num_views: Camera views for rendering (default: 150, matches training data)
-            image_size: Target image size for DINO feature extraction. Rendered images are
-                resized to this resolution before processing (default: 518)
-            render_image_size: Resolution for Blender rendering. Set to 512 to match training
-                data pipeline where images were rendered at 512x512 then resized to 518x518
-                for DINO feature extraction (default: 512)
-            radius: Camera distance from object center (default: 2.0, matches training data)
-            fov: Field of view in degrees (default: 40.0, matches training data)
-            seed: Random seed for camera view sampling
-            voxel_size: Voxel size for discretization (default: 1/64)
-            max_voxels: Maximum voxels to generate
-            blender_path: Path to Blender executable. If None, uses fallback installation.
-            query_points: Where to evaluate material properties. Can be:
-                - "mesh_vertices" (default): Evaluate at mesh vertices
-                - "voxel_centers": Evaluate at voxel centers
-                - numpy array (N, 3): Custom 3D coordinates for evaluation
-                - None: Same as "voxel_centers"
-            use_gpu: Whether to use GPU acceleration for Blender rendering
-            gpu_device: GPU device type for Blender - "OPTIX", "CUDA", or "OPENCL"
-            num_render_jobs: Number of parallel Blender processes for rendering (default: 1)
-            dino_batch_size: Number of images to process simultaneously during DINO feature extraction (higher values use more GPU memory but may be faster)
-            return_original_scale: If True, return coordinates in original mesh scale instead of
-                normalized [-0.5, 0.5] space. Transformation parameters (center, scale) are included
-                in results for reference. (default: False)
-            **kwargs: Additional feature extraction arguments
-
-        Returns:
-            Dictionary containing material properties:
-            - 'youngs_modulus': Young's modulus values at query points (Pa)
-            - 'poisson_ratio': Poisson's ratio values at query points
-            - 'density': Density values at query points (kg/m³)
-            - 'query_coords_world': World coordinates of query points (normalized or original scale)
-            - 'voxel_coords_world': World coordinates of voxels (normalized or original scale)
-            - 'num_voxels': Number of voxels
-            - 'num_query_points': Number of query points (when applicable)
-            - 'transform_center': Center point used for normalization (when return_original_scale=True)
-            - 'transform_scale': Scale factor used for normalization (when return_original_scale=True)
+        Mesh/voxel coordinates share the rendered object's bounding-box frame.
+        Use query_points="voxel_centers" for direct model predictions. The default
+        interpolates onto rendered mesh vertices. Custom N x 3 query arrays are
+        in normalized coordinates; return_original_scale converts output locations
+        to the renderer's source-world frame. No inference noise is added.
+        Camera and voxel sampling both default to seed 0.
         """
+        self._require_preprocessing_dimensions()
+
+        from dataset_toolkits.material_objects.render_mesh import feature_segment_ids, load_render_geometry, sampling_seed
+
         if output_dir is None:
             mesh_name = os.path.splitext(os.path.basename(mesh_path))[0]
             output_dir = f"/tmp/Vomp_mesh_{mesh_name}"
-
-        print("=== Vomp: Mesh Material Estimation ===")
-
-        # Define built-in mesh rendering and voxelization functions
-        def mesh_render_func(mesh_path, output_dir, num_views, image_size, **kwargs):
-            return self.render_mesh_views(
-                mesh_path,
-                output_dir,
-                num_views,
-                render_image_size,
-                blender_path=blender_path,
-                use_gpu=use_gpu,
-                gpu_device=gpu_device,
-                num_render_jobs=num_render_jobs,
-                **kwargs,
-            )
-
-        def mesh_voxelize_func(mesh_path, output_dir, **kwargs):
-            return self._voxelize_mesh(
-                mesh_path, output_dir, voxel_size=voxel_size, max_voxels=max_voxels
-            )
-
-        # Step 1: Extract features using built-in mesh functions
-        print("Step 1: Extracting features...")
-
-        # Prepare rendering parameters for kwargs
-        render_kwargs = {
-            "radius": radius,
-            "fov": fov,
-            "seed": seed,
-        }
-
-        coords, features = self.get_features(
-            obj_3d=mesh_path,
-            render_func=mesh_render_func,
-            voxelize_func=mesh_voxelize_func,
-            num_views=num_views,
-            image_size=image_size,
-            output_dir=output_dir,
-            batch_size=dino_batch_size,
-            **render_kwargs,
-            **kwargs,
+        frames = self.render_mesh_views(
+            mesh_path, output_dir, num_views=num_views, image_size=render_image_size,
+            radius=radius, fov=fov, seed=seed, blender_path=blender_path,
+            dataset=usd_dataset,
         )
+        centers = self._voxelize_mesh(mesh_path, output_dir, voxel_size=voxel_size)
+        coords, features = self.get_features(
+            renders_metadata=frames, voxel_centers=centers, output_dir=output_dir,
+            image_size=image_size, batch_size=dino_batch_size, save_features=save_features,
+        )
+        labels = feature_segment_ids(output_dir, coords[:, 1:].cpu().numpy())
+        voxel_results = self.predict_materials(
+            coords, features, max_voxels=32768 if max_voxels is None else max_voxels,
+            sampling_seed=sampling_seed(seed), segment_ids=labels,
+        )
+        geometry, manifest = load_render_geometry(mesh_path, output_dir)
+        normalization = manifest["normalization"]
+        center = np.asarray(normalization["source_center"])
+        scale = float(normalization["source_scale"])
 
-        # Step 2: Run inference on the features
-        print("Step 2: Running material inference...")
-        predict_kwargs = {}
-        if max_voxels is not None:
-            predict_kwargs["max_voxels"] = max_voxels
-        voxel_results = self.predict_materials(coords, features, **predict_kwargs)
-
-        # Handle query_points parameter
-        if query_points == "mesh_vertices":
-            # Step 3: Evaluate materials at mesh vertices
-            print("Step 3: Evaluating materials at mesh vertices...")
-
-            # Load mesh to get vertices
-            mesh = trimesh.load(mesh_path)
-            if hasattr(mesh, "vertices"):
-                mesh_vertices = mesh.vertices
-            else:
-                # Mesh scene - combine all vertices
-                vertices_list = []
-                for geometry in mesh.geometry.values():
-                    if hasattr(geometry, "vertices"):
-                        vertices_list.append(geometry.vertices)
-                if not vertices_list:
-                    raise ValueError("No vertices found in mesh")
-                mesh_vertices = np.vstack(vertices_list)
-
-            # Get transformation parameters
-            center, scale = get_mesh_transform_params(mesh_path)
-
-            # Normalize vertices to match model's coordinate system (same as _voxelize_mesh)
-            normalized_vertices = (mesh_vertices - center) / scale
-            normalized_vertices = np.clip(normalized_vertices, -0.5 + 1e-6, 0.5 - 1e-6)
-
-            # Create upsampler from voxel results
-            upsampler = MaterialUpsampler(
-                voxel_coords=voxel_results["voxel_coords_world"],
-                voxel_materials=np.column_stack(
-                    [
-                        voxel_results["youngs_modulus"],
-                        voxel_results["poisson_ratio"],
-                        voxel_results["density"],
-                    ]
-                ),
-            )
-
-            # Interpolate to mesh vertices
-            vertex_materials, vertex_distances = upsampler.interpolate(
-                normalized_vertices
-            )
-
-            # Apply inverse transformation
-            if return_original_scale:
-                output_coords = denormalize_coords(normalized_vertices, center, scale)
-                output_voxel_coords = denormalize_coords(
-                    voxel_results["voxel_coords_world"], center, scale
-                )
-            else:
-                output_coords = normalized_vertices
-                output_voxel_coords = voxel_results["voxel_coords_world"]
-
-            # Create final results
-            results = {
-                "youngs_modulus": vertex_materials[:, 0],
-                "poisson_ratio": vertex_materials[:, 1],
-                "density": vertex_materials[:, 2],
-                "query_coords_world": output_coords,
-                "query_distances": vertex_distances,
-                "voxel_coords_world": output_voxel_coords,
-                "num_voxels": voxel_results["num_voxels"],
-                "num_query_points": len(normalized_vertices),
-            }
-
-            # Add transformation parameters if in original scale
-            if return_original_scale:
-                results["transform_center"] = center
-                results["transform_scale"] = scale
-
-            print(
-                f"✓ Evaluated materials at {len(normalized_vertices):,} mesh vertices"
-            )
-        elif query_points == "voxel_centers" or query_points is None:
-            # Return voxel-level results (original behavior)
+        if isinstance(query_points, str) and query_points == "mesh_vertices":
+            query_coords = geometry["vertices"]
+        elif query_points is None or (
+            isinstance(query_points, str) and query_points == "voxel_centers"
+        ):
             results = voxel_results
-
-            # Apply inverse transformation
             if return_original_scale:
-                # Get transformation parameters
-                center, scale = get_mesh_transform_params(mesh_path)
-
-                # Transform coordinates back to original scale
                 results["voxel_coords_world"] = denormalize_coords(
                     results["voxel_coords_world"], center, scale
                 )
                 results["transform_center"] = center
                 results["transform_scale"] = scale
-
+            return results
         elif isinstance(query_points, np.ndarray):
-            # Step 3: Evaluate materials at custom query points
-            print(
-                f"Step 3: Evaluating materials at {len(query_points)} custom query points..."
-            )
-
-            # Create upsampler from voxel results
-            upsampler = MaterialUpsampler(
-                voxel_coords=voxel_results["voxel_coords_world"],
-                voxel_materials=np.column_stack(
-                    [
-                        voxel_results["youngs_modulus"],
-                        voxel_results["poisson_ratio"],
-                        voxel_results["density"],
-                    ]
-                ),
-            )
-
-            # Interpolate to custom query points
-            query_materials, query_distances = upsampler.interpolate(query_points)
-
-            # Apply inverse transformation
-            if return_original_scale:
-                # Get transformation parameters
-                center, scale = get_mesh_transform_params(mesh_path)
-
-                output_coords = denormalize_coords(query_points, center, scale)
-                output_voxel_coords = denormalize_coords(
-                    voxel_results["voxel_coords_world"], center, scale
-                )
-            else:
-                output_coords = query_points
-                output_voxel_coords = voxel_results["voxel_coords_world"]
-
-            # Create final results
-            results = {
-                "youngs_modulus": query_materials[:, 0],
-                "poisson_ratio": query_materials[:, 1],
-                "density": query_materials[:, 2],
-                "query_coords_world": output_coords,
-                "query_distances": query_distances,
-                "voxel_coords_world": output_voxel_coords,
-                "num_voxels": voxel_results["num_voxels"],
-                "num_query_points": len(query_points),
-            }
-
-            # Add transformation parameters if in original scale
-            if return_original_scale:
-                results["transform_center"] = center
-                results["transform_scale"] = scale
-
-            print(f"✓ Evaluated materials at {len(query_points):,} custom query points")
+            query_coords = np.asarray(query_points, dtype=np.float32)
+            if query_coords.ndim != 2 or query_coords.shape[1] != 3 or not np.isfinite(query_coords).all():
+                raise ValueError("query_points must be a finite N x 3 array in normalized coordinates")
         else:
-            raise ValueError(
-                f"Invalid query_points value: {query_points}. Must be 'mesh_vertices', 'voxel_centers', None, or numpy array."
-            )
+            raise ValueError("query_points must be mesh_vertices, voxel_centers, None or an N x 3 array")
 
-        print("✓ Material estimation complete!")
+        upsampler = MaterialUpsampler(
+            voxel_coords=voxel_results["voxel_coords_world"],
+            voxel_materials=np.column_stack([
+                voxel_results["youngs_modulus"], voxel_results["poisson_ratio"],
+                voxel_results["density"],
+            ]),
+        )
+        materials, distances = upsampler.interpolate(query_coords)
+        output_coords = query_coords
+        output_voxels = voxel_results["voxel_coords_world"]
+        if return_original_scale:
+            output_coords = denormalize_coords(output_coords, center, scale)
+            output_voxels = denormalize_coords(output_voxels, center, scale)
+        results = {
+            "youngs_modulus": materials[:, 0], "poisson_ratio": materials[:, 1],
+            "density": materials[:, 2], "query_coords_world": output_coords,
+            "query_distances": distances, "voxel_coords_world": output_voxels,
+            "num_voxels": voxel_results["num_voxels"], "num_query_points": len(query_coords),
+        }
+        if return_original_scale:
+            results["transform_center"] = center
+            results["transform_scale"] = scale
         return results
 
     @torch.inference_mode()
     def get_usd_materials(
         self,
         usd_path: str,
-        mesh_path: Optional[str] = None,
         output_dir: Optional[str] = None,
         num_views: int = 150,
         image_size: int = 518,
         render_image_size: int = 512,
-        radius: float = 2.0,
+        radius: Optional[float] = None,
         fov: float = 40.0,
         seed: Optional[int] = None,
         voxel_size: float = 1 / 64,
         max_voxels: Optional[int] = 32768,
-        isaac_sim_path: Optional[str] = None,
-        render_mode: str = "path_tracing",
-        rtx_settings_override: Optional[Dict[str, Any]] = None,
         query_points: Union[str, np.ndarray, None] = "voxel_centers",
         dino_batch_size: int = 16,
         use_simready_usd_format: bool = False,
         blender_path: Optional[str] = None,
-        gpu_device: str = "OPTIX",
-        num_render_jobs: int = 1,
         return_original_scale: bool = False,
-        **kwargs: Any,
+        save_features: bool = True,
     ) -> Dict[str, np.ndarray]:
-        """
-        High-level API for USD asset material property inference.
+        """Use the training USD renderer, composed mesh and material segments.
 
-        USD files can come in many different formats with varying internal structures,
-        materials, and organization. In the general case, users should provide both:
-        1. The USD file for rendering
-        2. An extracted mesh file (OBJ/PLY/STL) for voxelization
-
-        However, if your USD file is in the SimReady format (like the USD files in our
-        dataset), you can set use_simready_usd_format=True.
-        This will automatically:
-        - Extract mesh geometry, materials, and UV coordinates from the USD
-        - Convert to OBJ format matching the dataset preprocessing pipeline
-        - Render with Blender using the exact same pipeline used to create training data
-
-        Args:
-            usd_path: Path to USD asset file (.usd, .usda, .usdc)
-            mesh_path: Path to mesh file (OBJ, PLY, STL, etc.) for voxelization.
-                If None and use_simready_usd_format=True, voxelizes the converted OBJ.
-                Required if use_simready_usd_format=False (for Replicator mode).
-            output_dir: Directory for intermediate files
-            num_views: Camera views for rendering (default: 150, matches training data)
-            image_size: Target image size for DINO feature extraction. Rendered images are
-                resized to this resolution before processing (default: 518)
-            render_image_size: Resolution for rendering. Set to 512 to match training
-                data pipeline where images were rendered at 512x512 then resized to 518x518
-                for DINO feature extraction (default: 512)
-            radius: Camera distance from object center (default: 2.0, matches training data)
-            fov: Field of view in degrees (default: 40.0, matches training data)
-            seed: Random seed for camera view sampling
-            voxel_size: Voxel size for discretization
-            max_voxels: Maximum voxels to generate
-            isaac_sim_path: Path to Isaac Sim executable (isaac-sim.sh).
-                Only used if use_simready_usd_format=False.
-                If None, uses ISAAC_SIM_PATH environment variable.
-            render_mode: Rendering quality preset (Replicator only):
-                - "fast": Real-time ray tracing (faster, good quality)
-                - "path_tracing": Path tracing (slower, highest quality)
-            rtx_settings_override: Optional dict to override specific RTX settings (Replicator only).
-                Example: {"/rtx/pathtracing/spp": 512} for higher quality
-            query_points: Where to evaluate material properties. Can be:
-                - "voxel_centers" (default): Evaluate at voxel centers
-                - numpy array (N, 3): Custom 3D coordinates for evaluation
-                - None: Same as "voxel_centers"
-            dino_batch_size: Number of images to process simultaneously during
-                DINO feature extraction
-            use_simready_usd_format: If True, treats the USD as SimReady format
-                (like assets in datasets/raw/simready). Automatically converts USD to OBJ
-                with materials/textures and renders with Blender, matching the dataset
-                preprocessing pipeline. If False (default), uses Isaac Sim Replicator.
-            blender_path: Path to Blender executable (only used if use_simready_usd_format=True).
-                If None, attempts to auto-detect.
-            gpu_device: GPU rendering device for Blender (only used if use_simready_usd_format=True).
-                Options: "OPTIX" (default), "CUDA", "METAL", "NONE"
-            num_render_jobs: Number of parallel Blender render jobs (only used if use_simready_usd_format=True).
-            return_original_scale: If True, return coordinates in original mesh scale instead of
-                normalized [-0.5, 0.5] space. Transformation parameters (center, scale) are included
-                in results for reference. (default: False)
-            **kwargs: Additional feature extraction arguments
-
-        Returns:
-            Dictionary containing material properties:
-            - 'youngs_modulus': Young's modulus values (Pa)
-            - 'poisson_ratio': Poisson's ratio values
-            - 'density': Density values (kg/m³)
-            - 'voxel_coords_world': World coordinates of voxels (normalized or original scale)
-            - 'query_coords_world': World coordinates of query points (when using custom points)
-            - 'num_voxels': Number of voxels
-            - 'num_query_points': Number of query points (when applicable)
-            - 'transform_center': Center point used for normalization (when return_original_scale=True)
-            - 'transform_scale': Scale factor used for normalization (when return_original_scale=True)
-
-        Example:
-            >>> # Replicator mode (default) - requires separate mesh file
-            >>> model = Vomp.from_checkpoint(config_path)
-            >>> results = model.get_usd_materials(
-            ...     usd_path="model.usd",
-            ...     mesh_path="model.ply",
-            ...     isaac_sim_path="~/isaac-sim/isaac-sim.sh",
-            ...     render_mode="path_tracing"
-            ... )
-            >>>
-            >>> # SimReady USD format
-            >>> results = model.get_usd_materials(
-            ...     usd_path="datasets/raw/simready/common_assets/props/dellwood_ottoman/dellwood_ottoman_inst_base.usd",
-            ...     use_simready_usd_format=True,
-            ...     blender_path="/usr/bin/blender",
-            ...     seed=42
-            ... )
+        use_simready_usd_format selects the SimReady material loader; otherwise
+        the common USD loader is used. Both render with Cycles 4.2.
         """
         if output_dir is None:
             asset_name = os.path.splitext(os.path.basename(usd_path))[0]
             output_dir = f"/tmp/Vomp_usd_{asset_name}"
-
-        # Select rendering backend
-        if use_simready_usd_format:
-
-            # Convert USD to OBJ in a temporary directory
-            temp_obj_path, temp_dir = convert_usd_to_obj(usd_path)
-
-            try:
-                print(f"✓ USD converted to OBJ: {temp_obj_path}")
-
-                results = self.get_mesh_materials(
-                    mesh_path=temp_obj_path,
-                    output_dir=output_dir,
-                    num_views=num_views,
-                    image_size=image_size,
-                    radius=radius,
-                    fov=fov,
-                    seed=seed,
-                    voxel_size=voxel_size,
-                    max_voxels=max_voxels,
-                    blender_path=blender_path,
-                    gpu_device=gpu_device,
-                    num_render_jobs=num_render_jobs,
-                    query_points=query_points,
-                    dino_batch_size=dino_batch_size,
-                    return_original_scale=return_original_scale,
-                    **kwargs,
-                )
-
-                return results
-
-            finally:
-                # Clean up temporary directory
-                if os.path.exists(temp_dir):
-                    print(f"Cleaning up temporary directory: {temp_dir}")
-                    shutil.rmtree(temp_dir)
-
-        else:
-
-            if mesh_path is None:
-                raise ValueError(
-                    "mesh_path is required when use_blender_render=False. "
-                    "Provide a separate mesh file for voxelization, or set use_blender_render=True "
-                    "to automatically convert USD to OBJ."
-                )
-
-            # Define rendering function using Replicator
-            def usd_render_func(usd_path, output_dir, num_views, image_size, **kwargs):
-                # Use render_image_size for actual rendering (default 512 to match training data)
-                return self.render_views_replicator(
-                    asset_path=usd_path,
-                    output_dir=output_dir,
-                    num_views=num_views,
-                    image_size=render_image_size,
-                    isaac_sim_path=isaac_sim_path,
-                    render_mode=render_mode,
-                    rtx_settings_override=rtx_settings_override,
-                    **kwargs,
-                )
-
-            # Define voxelization function using the provided mesh
-            def usd_voxelize_func(usd_path, output_dir, **kwargs):
-                # Use the separate mesh file for voxelization
-                # Note: The mesh may not be normalized, so _voxelize_mesh will handle that
-                return self._voxelize_mesh(
-                    mesh_path, output_dir, voxel_size=voxel_size, max_voxels=max_voxels
-                )
-
-            # Step 1: Extract features
-            print("Step 1: Extracting features...")
-
-            # Prepare rendering parameters for kwargs
-            render_kwargs = {
-                "radius": radius,
-                "fov": fov,
-                "seed": seed,
-            }
-
-            coords, features = self.get_features(
-                obj_3d=usd_path,
-                render_func=usd_render_func,
-                voxelize_func=usd_voxelize_func,
-                num_views=num_views,
-                image_size=image_size,
-                output_dir=output_dir,
-                batch_size=dino_batch_size,
-                **render_kwargs,
-                **kwargs,
-            )
-
-            # Step 2: Run inference on the features
-            print("Step 2: Running material inference...")
-            predict_kwargs = {}
-            if max_voxels is not None:
-                predict_kwargs["max_voxels"] = max_voxels
-            voxel_results = self.predict_materials(coords, features, **predict_kwargs)
-
-            # Handle query_points parameter
-            if query_points == "voxel_centers" or query_points is None:
-                # Return voxel-level results
-                results = voxel_results
-
-                # Apply inverse transformation
-                if return_original_scale:
-                    # Get transformation parameters
-                    center, scale = get_mesh_transform_params(mesh_path)
-
-                    # Transform coordinates back to original scale
-                    results["voxel_coords_world"] = denormalize_coords(
-                        results["voxel_coords_world"], center, scale
-                    )
-                    results["transform_center"] = center
-                    results["transform_scale"] = scale
-
-            elif isinstance(query_points, np.ndarray):
-                # Step 3: Evaluate materials at custom query points
-                print(
-                    f"Step 3: Evaluating materials at {len(query_points)} custom query points..."
-                )
-
-                # Create upsampler from voxel results
-                upsampler = MaterialUpsampler(
-                    voxel_coords=voxel_results["voxel_coords_world"],
-                    voxel_materials=np.column_stack(
-                        [
-                            voxel_results["youngs_modulus"],
-                            voxel_results["poisson_ratio"],
-                            voxel_results["density"],
-                        ]
-                    ),
-                )
-
-                # Interpolate to custom query points
-                query_materials, query_distances = upsampler.interpolate(query_points)
-
-                # Apply inverse transformation
-                if return_original_scale:
-                    # Get transformation parameters
-                    center, scale = get_mesh_transform_params(mesh_path)
-
-                    output_coords = denormalize_coords(query_points, center, scale)
-                    output_voxel_coords = denormalize_coords(
-                        voxel_results["voxel_coords_world"], center, scale
-                    )
-                else:
-                    output_coords = query_points
-                    output_voxel_coords = voxel_results["voxel_coords_world"]
-
-                # Create final results
-                results = {
-                    "youngs_modulus": query_materials[:, 0],
-                    "poisson_ratio": query_materials[:, 1],
-                    "density": query_materials[:, 2],
-                    "query_coords_world": output_coords,
-                    "query_distances": query_distances,
-                    "voxel_coords_world": output_voxel_coords,
-                    "num_voxels": voxel_results["num_voxels"],
-                    "num_query_points": len(query_points),
-                }
-
-                # Add transformation parameters if in original scale
-                if return_original_scale:
-                    results["transform_center"] = center
-                    results["transform_scale"] = scale
-
-                print(
-                    f"✓ Evaluated materials at {len(query_points):,} custom query points"
-                )
-            else:
-                raise ValueError(
-                    f"Invalid query_points value: {query_points}. Must be 'voxel_centers', None, or numpy array."
-                )
-
-            print("✓ Material estimation complete!")
-            return results
+        return self.get_mesh_materials(
+            usd_path, output_dir=output_dir, num_views=num_views,
+            image_size=image_size, render_image_size=render_image_size,
+            radius=radius, fov=fov, seed=seed, voxel_size=voxel_size,
+            max_voxels=max_voxels, blender_path=blender_path,
+            query_points=query_points, dino_batch_size=dino_batch_size,
+            return_original_scale=return_original_scale,
+            usd_dataset="simready" if use_simready_usd_format else "common",
+            save_features=save_features,
+        )

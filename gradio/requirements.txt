@@ -1,7 +1,9 @@
-gradio
--e git+https://github.com/nv-tlabs/vomp.git#egg=vomp
+# Install after the root install_env.sh.
+# The root setup installs VoMP and builds the vox2seq CUDA extension.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+gradio==6.2.0
 polyscope==2.5.0
-typing==3.7.4.3
 trimesh==4.8.1
 Pillow==11.0.0
 safetensors==0.6.2
@@ -12,12 +14,26 @@ pyparsing==3.2.3
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 matplotlib==3.7.5
-torch==2.4.0
-torch-tensorrt==2.4.0
-torchvision==0.19.0
-xformers==0.0.27.post2
+torch==2.4.0+cu118
+torchvision==0.19.0+cu118
+xformers==0.0.27.post2+cu118
 git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d
-https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-spconv-cu120
---find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.9.post1/flash_attn-2.5.9.post1+cu118torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+spconv-cu118==2.3.8
+--find-links https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu118.html
 kaolin==0.18.0
+spaces
+bpy==4.2.0
+gsplat==1.5.2
+open3d==0.19.0
+libigl==2.6.2
+usd-core==25.5
+pandas==2.2.3
+scikit-learn==1.6.1
+fpsample==0.3.3
+einops==0.8.1
+tqdm==4.67.1
+plyfile==1.1.2
+transformers==4.51.3
+openai==1.106.1
+qwen-vl-utils==0.0.11

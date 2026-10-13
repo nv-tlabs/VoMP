@@ -14,6 +14,6 @@
 # limitations under the License.
 
 from .geometry_encoder import GeometryEncoder
-from .material_vae.beta_tc import TripletVAE
+from .material_vae import TripletVAE, StandardVAE
 
-__all__ = ["GeometryEncoder", "TripletVAE"]
+__all__ = ["GeometryEncoder", "TripletVAE", "StandardVAE"]

@@ -14,587 +14,525 @@
 # limitations under the License.
 
 import logging
+import hashlib
+import json
 import os
-import re
-import torch
 import base64
-
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-from qwen_vl_utils import process_vision_info
-from openai import OpenAI
+import threading
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from dataset_toolkits.material_objects.vlm_annotations.utils.utils import (
-    find_reference_materials,
-    load_material_ranges,
-    parse_numerical_range_str,
+    MATERIAL_RANGES_CSV,
 )
+from dataset_toolkits.material_objects.vlm_annotations.vlm_input_builder import (
+    VLM_IMAGE_ROLES,
+)
+from dataset_toolkits.material_objects.vlm_annotations.vlm_output import (
+    parse_vlm_properties,
+    raw_vlm_output_sha256,
+)
+import torch
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from openai import OpenAI, APIConnectionError, APIStatusError
+from qwen_vl_utils import process_vision_info
+import traceback
+
+
+QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-72B-Instruct"
+
+
+class APIRetryGate:
+    """Pause every API worker together after a transient service failure."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.resume_at = 0.0
+
+    def wait(self):
+        with self.condition:
+            while True:
+                remaining = self.resume_at - time.monotonic()
+                if remaining <= 0:
+                    return
+                self.condition.wait(timeout=remaining)
+
+    def pause(self, seconds):
+        seconds = max(60.0, float(seconds))
+        with self.condition:
+            now = time.monotonic()
+            resume_at = now + seconds
+            should_log = (
+                self.resume_at <= now or resume_at - self.resume_at >= 1.0
+            )
+            self.resume_at = max(self.resume_at, resume_at)
+            self.condition.notify_all()
+        if should_log:
+            logging.warning(
+                "Responses API failure; pausing all API requests for "
+                "%.0f seconds before retrying",
+                seconds,
+            )
+
+
+api_retry_gate = APIRetryGate()
+
+
+def retry_after_seconds(error):
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return 60.0
+
+    retry_after_ms = headers.get("retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            return max(60.0, float(retry_after_ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+
+    retry_after = headers.get("retry-after")
+    if retry_after is not None:
+        try:
+            return max(60.0, float(retry_after))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(retry_after))
+                return max(60.0, retry_at.timestamp() - time.time())
+            except (AttributeError, OSError, TypeError, ValueError, OverflowError):
+                pass
+    return 60.0
+
+
+@dataclass(frozen=True)
+class ResponsesAPIConfig:
+    """Settings for the Responses API."""
+
+    base_url: str
+    model: str
+    reasoning_effort: str = "max"
+    image_detail: str = "original"
+    max_output_tokens: int = 16384
+    concurrency: int = 4
+    max_retries: int = 0
+
+    @property
+    def identity(self):
+        policy = {
+            "backend": "responses",
+            "base_url": self.base_url,
+            "image_detail": self.image_detail,
+            "max_output_tokens": self.max_output_tokens,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+        }
+        return "responses-api:" + json.dumps(
+            policy,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 SYSTEM_PROMPT = """
-You are a materials science expert specializing in analyzing material properties from visual appearances and physical data. Your task is to provide precise numerical estimates for Young's modulus, Poisson's ratio, and density based on the images and context provided.
+You are a materials science expert estimating Young's modulus, Poisson's ratio, and density from images and context clues.
 
-Important Context: The material segment you are analyzing may be an internal component or structure that is not visible from the outside of the object. For example:
-- Internal support structures, frames, or reinforcements
-- Hidden layers or core materials
-- Components enclosed within the outer shell
-- Structural elements that are only visible when the object is disassembled
+The selected part may be visible from the outside or may be an internal support, frame, reinforcement, hidden layer, or core. A soft exterior can hide a rigid frame, and a visible finish can cover a different underlying material. Use the selected part's shape, material-name clue, part-name clue, and role in the whole object to decide what physical material the selected part represents. Treat every name as a clue rather than ground truth.
 
-When analyzing:
-- Consider that the material might be completely hidden from external view
-- Use the semantic usage and material type hints to infer properties of internal components
-- Internal structural components often have different properties than visible surfaces
-- For example, a soft exterior might hide a rigid internal frame
+When web search is available, use it to check the likely material and representative property values before answering.
 
-Critical Instruction: You MUST provide numerical estimates for ALL materials, even organic, biological, or unusual materials like leaves, feathers, or paper. 
-- For organic materials, estimate properties based on similar natural materials with known values
-- For leaves, consider them as thin plant fiber composites with values similar to paper or dried plant fibers
-- Never respond with "N/A" or any non-numeric value in your property estimates
+You must provide numerical estimates for every material, including organic, biological, or unusual materials such as leaves, feathers, and paper. For natural materials, use comparable materials with known properties. Never answer with N/A, unknown, or another non-numeric value.
 
-When analyzing materials, use step-by-step reasoning:
-1. First identify the likely material class and subtype based on visual appearance (if visible) or contextual clues (if internal)
-2. Consider how texture, color, and reflectivity inform your understanding of the material (when visible)
-3. Incorporate the provided physical properties and contextual usage information
-4. For each mechanical property, reason through how the visual and physical attributes lead to your estimate
-5. Consider how the material compares to reference materials with known properties
-6. If the material appears to be internal/hidden, use the object type and usage context to make informed estimates
+Reason in this order:
+1. Identify the likely material class and subtype from the images and context clues.
+2. Consider texture, color, reflectivity, shape, and the part's role in the object.
+3. Decide whether the selected part is a bulk component, internal structure, cover, coating, or surface layer.
+4. Reason through each property estimate using the likely material and physical form.
+5. Use an optional reference range only when it agrees with the images and the selected part.
 
-Important Formatting Requirements:
-- Young's modulus must be provided in scientific notation followed by "Pa" (e.g., 2.0e11 Pa)
-- Poisson's ratio must be a simple decimal between 0.0 and 0.5 with no units (e.g., 0.34)
-- Density must be provided in kg/m^3 (e.g., 7800 kg/m^3)
-- Each property must be on its own line with exactly the label shown in the examples
-- Do not include explanatory text or parenthetical notes after the values
-- ALWAYS provide numerical values, never text like "N/A" or "unknown"
+Formatting requirements:
+- Young's modulus must use scientific notation followed by Pa.
+- Poisson's ratio must be a decimal between 0.0 and 0.5 with no units.
+- Density must be in kg/m^3.
+- Use the exact property labels shown in the examples, with one property per line.
+- Do not put explanatory text after the three values.
 """
 
-MATERIAL_RANGES = load_material_ranges()
+STRICT_RETRY_USER_PROMPT_SUFFIX = (
+    "\n\nIMPORTANT: You MUST provide numerical values for Young's modulus, "
+    "Poisson's ratio, and density."
+)
+STRICT_RETRY_QUERY_PROMPT_SUFFIX = (
+    "\n\nCRITICAL: You MUST provide valid numerical estimates for ALL three "
+    "properties."
+)
+
+
+def current_vlm_text_context_hash(
+    prompts: Mapping[str, str],
+    *,
+    material_ranges_path: str | os.PathLike[str] | None = None,
+) -> str:
+    """Hash the prompts and material reference table."""
+
+    if not isinstance(prompts, Mapping) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in prompts.items()
+    ):
+        raise TypeError("VLM prompt templates must be a string-to-string mapping")
+    missing_templates = {"few_shot_examples", "query_prompt"} - set(prompts)
+    if missing_templates:
+        raise ValueError(
+            "VLM prompt templates are missing: "
+            + ", ".join(sorted(missing_templates))
+        )
+    ranges_path = Path(material_ranges_path or MATERIAL_RANGES_CSV)
+    ranges_bytes = ranges_path.read_bytes()
+    prompt_bytes = json.dumps(
+        dict(prompts),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    components = (
+        ("system_prompt", SYSTEM_PROMPT.encode("utf-8")),
+        ("prompt_templates", prompt_bytes),
+        ("material_ranges_csv", ranges_bytes),
+        (
+            "retry_user_prompt_suffix",
+            STRICT_RETRY_USER_PROMPT_SUFFIX.encode("utf-8"),
+        ),
+        (
+            "retry_query_prompt_suffix",
+            STRICT_RETRY_QUERY_PROMPT_SUFFIX.encode("utf-8"),
+        ),
+    )
+    digest = hashlib.sha256(b"vlm-text-context\0")
+    for label, payload in components:
+        digest.update(label.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def encode_image(image_path):
-    """Encode image to base64 for Gemini API."""
+    """Encode one request image as Base64 for an API data URL."""
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def parse_vlm_properties(output_text):
-    """
-    Parses VLM output text to extract analysis and mechanical properties.
-    Uses multiple strategies to handle different formats and potential parsing issues.
+def request_image_paths(visual_image_paths):
+    """Check and return the ordered VLM input images."""
 
-    Args:
-        output_text (str): Raw output text from the VLM
+    if visual_image_paths is None:
+        raise ValueError(
+            "VLM annotation requires the current four-image input tuple: original "
+            "thumbnail, textured whole object, textured selected part, and "
+            "selected material sphere"
+        )
+    paths = tuple(os.fspath(path) for path in visual_image_paths)
+    if len(paths) != len(VLM_IMAGE_ROLES):
+        raise ValueError(
+            f"production VLM request requires exactly {len(VLM_IMAGE_ROLES)} "
+            f"images, received {len(paths)}"
+        )
+    missing = [path for path in paths if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            "production VLM request image(s) are missing: " + ", ".join(missing)
+        )
+    return tuple(zip(VLM_IMAGE_ROLES, paths))
 
-    Returns:
-        dict: Dictionary with extracted analysis and properties
-    """
-    analysis = ""
-    youngs_modulus = None
-    poissons_ratio = None
-    density = None
 
-    analysis_lines = []
-    capturing_analysis = False
+def vlm_error_result(
+    error,
+    *,
+    raw_output="",
+    request_prompt="",
+    web_search_used=False,
+):
+    """Record a model attempt that returned no response."""
 
-    for line in output_text.split("\n"):
-        line = line.strip()
-        if line.lower().startswith("analysis:"):
-            capturing_analysis = True
-            analysis_lines.append(line.split(":", 1)[1].strip())
-        elif capturing_analysis and (
-            line.lower().startswith("young")
-            or line.lower().startswith("poisson")
-            or line.lower().startswith("density")
-        ):
-            capturing_analysis = False
-        elif capturing_analysis and line:
-            analysis_lines.append(line)
-
-    analysis = "\n".join(analysis_lines)
-
-    try:
-
-        modulus_line = ""
-        for line in output_text.split("\n"):
-            if line.lower().startswith("young"):
-                modulus_line = line
-                break
-
-        if modulus_line:
-
-            numeric_matches = re.findall(r"([0-9][0-9.eE+\-]*)", modulus_line)
-            if numeric_matches:
-                value_str = numeric_matches[0].replace(",", "").strip()
-                youngs_modulus = float(value_str)
-                logging.info(
-                    f"Successfully extracted Young's modulus: {youngs_modulus} from line '{modulus_line}'"
-                )
-
-                if youngs_modulus < 1000 and "g" in modulus_line.lower():
-                    youngs_modulus *= 1.0e9
-                    logging.info(
-                        f"Converted Young's modulus from GPa to Pa: {youngs_modulus}"
-                    )
-    except Exception as e:
-        logging.error(f"First Young's modulus extraction approach failed: {e}")
-
-    if youngs_modulus is None:
-        try:
-            modulus_pattern = re.compile(
-                r"young'?s\s+modulus\s*[:\-]?\s*([0-9][0-9.eE+\-]*)", re.IGNORECASE
-            )
-            modulus_match = modulus_pattern.search(output_text)
-            if modulus_match:
-                value_str = modulus_match.group(1).replace(",", "")
-                youngs_modulus = float(value_str)
-
-                if (
-                    youngs_modulus < 1000
-                    and "g" in output_text.lower().split("young")[1].split("\n")[0]
-                ):
-                    youngs_modulus *= 1.0e9
-
-                logging.info(
-                    f"Second Young's modulus extraction approach succeeded: {youngs_modulus}"
-                )
-        except Exception as e:
-            logging.error(f"Second Young's modulus extraction approach failed: {e}")
-
-    try:
-
-        ratio_line = ""
-        for line in output_text.split("\n"):
-            if line.lower().startswith("poisson"):
-                ratio_line = line
-                break
-
-        if ratio_line:
-
-            numeric_matches = re.findall(r"([0-9][0-9.eE+\-]*)", ratio_line)
-            if numeric_matches:
-                value_str = numeric_matches[0].replace(",", "").strip()
-                poissons_ratio = float(value_str)
-                logging.info(
-                    f"Successfully extracted Poisson's ratio: {poissons_ratio}"
-                )
-
-                if poissons_ratio < 0 or poissons_ratio > 0.5:
-                    logging.warning(
-                        f"Poisson's ratio out of normal range: {poissons_ratio}"
-                    )
-    except Exception as e:
-        logging.error(f"First Poisson's ratio extraction approach failed: {e}")
-
-    if poissons_ratio is None:
-        try:
-            ratio_pattern = re.compile(
-                r"poisson'?s\s+ratio\s*[:\-]?\s*([0-9][0-9.eE+\-]*)", re.IGNORECASE
-            )
-            ratio_match = ratio_pattern.search(output_text)
-            if ratio_match:
-                value_str = ratio_match.group(1).replace(",", "")
-                poissons_ratio = float(value_str)
-                logging.info(
-                    f"Second Poisson's ratio extraction approach succeeded: {poissons_ratio}"
-                )
-        except Exception as e:
-            logging.error(f"Second Poisson's ratio extraction approach failed: {e}")
-
-    try:
-
-        density_line = ""
-        for line in output_text.split("\n"):
-            if line.lower().startswith("density"):
-                density_line = line
-                break
-
-        if density_line:
-
-            cleaned_line = density_line.replace("kg/m³", "kg/m3").replace(
-                "kg/m^3", "kg/m3"
-            )
-
-            numeric_matches = re.findall(r"([0-9][0-9,.eE+\-]*)", cleaned_line)
-            if numeric_matches:
-                value_str = numeric_matches[0].replace(",", "").strip()
-                density = float(value_str)
-                logging.info(f"Successfully extracted density: {density}")
-    except Exception as e:
-        logging.error(f"First density extraction approach failed: {e}")
-
-    if density is None:
-        try:
-
-            density_pattern = re.compile(
-                r"density\s*[:\-]?\s*([0-9][0-9,.eE+\-]*)", re.IGNORECASE
-            )
-            density_match = density_pattern.search(output_text)
-            if density_match:
-                value_str = density_match.group(1).replace(",", "")
-                density = float(value_str)
-                logging.info(f"Second density extraction approach succeeded: {density}")
-        except Exception as e:
-            logging.error(f"Second density extraction approach failed: {e}")
-
-    if density is None:
-        try:
-            simple_pattern = re.compile(
-                r"density.*?(\d+(?:\.\d+)?)", re.IGNORECASE | re.DOTALL
-            )
-            simple_match = simple_pattern.search(output_text)
-            if simple_match:
-                density = float(simple_match.group(1))
-                logging.info(f"Last resort density extraction succeeded: {density}")
-        except Exception as e:
-            logging.error(f"Last resort density extraction failed: {e}")
-
-    result = {
-        "vlm_analysis": analysis,
-        "youngs_modulus": youngs_modulus,
-        "poissons_ratio": poissons_ratio,
-        "density": density,
-        "raw_vlm_output": output_text,
+    if not isinstance(raw_output, str):
+        raw_output = ""
+    return {
+        "error": str(error),
+        "raw_vlm_output": raw_output,
+        "raw_vlm_output_sha256": raw_vlm_output_sha256(raw_output),
+        "request_prompt": request_prompt,
+        "web_search_used": bool(web_search_used),
     }
 
-    missing_properties = []
-    if youngs_modulus is None:
-        missing_properties.append("Young's modulus")
-    if poissons_ratio is None:
-        missing_properties.append("Poisson's ratio")
-    if density is None:
-        missing_properties.append("density")
 
-    if missing_properties:
-        logging.warning(
-            f"Missing properties in VLM output: {', '.join(missing_properties)}"
-        )
-    else:
-        logging.info(
-            f"All properties extracted: Young's modulus={youngs_modulus}, Poisson's ratio={poissons_ratio}, Density={density}"
-        )
+def response_field(item, field):
+    """Read one Responses output field from either an SDK object or mapping."""
 
-    return result
+    if isinstance(item, Mapping):
+        return item.get(field)
+    return getattr(item, field, None)
 
 
-def load_vlm_model(model_type="qwen", api_key=None):
+def completed_web_search_calls(response):
+    """Return completed web-search output items from a Responses API result."""
+
+    output_items = getattr(response, "output", ()) or ()
+    return tuple(
+        item
+        for item in output_items
+        if response_field(item, "type") == "web_search_call"
+        and response_field(item, "status") == "completed"
+    )
+
+
+def vlm_model_identity(model, processor):
+    """Return the model name or API settings saved with annotations."""
+
+    if isinstance(processor, ResponsesAPIConfig):
+        return processor.identity
+    if isinstance(processor, str):
+        return f"api-model:{processor}"
+    return getattr(model, "name_or_path", None) or type(model).__name__
+
+
+def load_vlm_model(
+    model_type="qwen",
+    api_key=None,
+    *,
+    api_base_url=None,
+    api_model=None,
+    api_reasoning_effort="max",
+    api_image_detail="original",
+    api_max_output_tokens=16384,
+    api_concurrency=4,
+    api_max_retries=0,
+    api_timeout=600.0,
+):
     logging.info(f"Loading VLM model: {model_type}")
 
     if model_type == "qwen":
-        try:
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen2.5-VL-72B-Instruct",
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                attn_implementation="flash_attention_2",
-            )
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            QWEN_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+        processor = AutoProcessor.from_pretrained(
+            QWEN_MODEL_ID,
+            min_pixels=256 * 28 * 28,
+            max_pixels=1280 * 28 * 28,
+        )
+        return model, processor
 
-            min_pixels = 256 * 28 * 28
-            max_pixels = 1280 * 28 * 28
-            processor = AutoProcessor.from_pretrained(
-                "Qwen/Qwen2.5-VL-72B-Instruct",
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-            )
+    if model_type not in {"api", "responses-api"}:
+        raise ValueError(f"Unsupported VLM backend: {model_type}")
 
-            logging.info("Qwen VLM model loaded successfully")
-            return model, processor
-        except Exception as e:
-            logging.error(f"Failed to load Qwen VLM model: {str(e)}")
-            return None, None
+    api_base_url = api_base_url or os.getenv("VLM_API_BASE_URL")
+    api_model = api_model or os.getenv("VLM_API_MODEL")
+    if not api_base_url:
+        raise ValueError("Set --api-base-url or VLM_API_BASE_URL for the API backend")
+    if not api_model:
+        raise ValueError("Set --api-model or VLM_API_MODEL for the API backend")
 
-    elif model_type.startswith("gemini"):
-        if not api_key:
-            logging.error("API key is required for Gemini models")
-            return None, None
-
-        try:
-
-            client = OpenAI(
-                api_key=api_key,
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            )
-
-            logging.info(f"Gemini client created successfully for model: {model_type}")
-
-            return client, model_type
-        except Exception as e:
-            logging.error(f"Failed to create Gemini client: {str(e)}")
-            return None, None
-
-    elif model_type == "llama-3.2-90b-vision" or model_type == "llama-vision":
-
-        if not api_key:
-
-            api_key = os.getenv("NVIDIA_API_KEY")
-            if not api_key:
-                logging.error(
-                    "NVIDIA API key is required for llama-3.2-90b-vision model"
-                )
-                return None, None
-
-        try:
-
-            client = OpenAI(
-                api_key=api_key,
-                base_url="https://integrate.api.nvidia.com/v1",
-            )
-
-            logging.info("NVIDIA llama-3.2-90b-vision client created successfully")
-
-            return client, "nvdev/meta/llama-3.2-90b-vision-instruct"
-        except Exception as e:
-            logging.error(f"Failed to create NVIDIA llama vision client: {str(e)}")
-            return None, None
-
-    else:
-        logging.error(f"Unsupported model type: {model_type}")
-        return None, None
+    config = ResponsesAPIConfig(
+        base_url=api_base_url,
+        model=api_model,
+        reasoning_effort=api_reasoning_effort,
+        image_detail=api_image_detail,
+        max_output_tokens=api_max_output_tokens,
+        concurrency=api_concurrency,
+        max_retries=api_max_retries,
+    )
+    resolved_key = api_key or os.getenv("VLM_API_KEY")
+    if not resolved_key:
+        hostname = (urlsplit(config.base_url).hostname or "").casefold()
+        environment_key = {
+            "api.openai.com": "OPENAI_API_KEY",
+            "inference-api.nvidia.com": "NVIDIA_API_KEY",
+        }.get(hostname)
+        resolved_key = os.getenv(environment_key) if environment_key else None
+    if not resolved_key:
+        raise ValueError(
+            "Responses API key is missing; set VLM_API_KEY, OPENAI_API_KEY, "
+            "or NVIDIA_API_KEY for the selected host"
+        )
+    if isinstance(api_timeout, bool) or float(api_timeout) <= 0:
+        raise ValueError("API timeout must be positive")
+    client = OpenAI(
+        api_key=resolved_key,
+        base_url=config.base_url,
+        max_retries=0,
+        timeout=float(api_timeout),
+    )
+    logging.info(
+        "Responses API client created for %s with reasoning effort %s and "
+        "concurrency %d",
+        config.model,
+        config.reasoning_effort,
+        config.concurrency,
+    )
+    return client, config
 
 
 def analyze_material_with_vlm(
-    image_path,
-    material_info,
+    user_prompt,
     model,
     processor,
-    thumbnail_path,
-    dataset_name,
-    PROMPTS,
-    make_user_prompt,
-    parse_vlm_output,
+    prompts,
+    visual_image_paths,
 ):
-    if dataset_name == "simready":
-        material_type = material_info.get("material_type", "unknown")
-        opacity = material_info.get("opacity", "opaque")
-        density = material_info.get("density", None)
-        dynamic_friction = material_info.get("dynamic_friction", None)
-        static_friction = material_info.get("static_friction", None)
-        restitution = material_info.get("restitution", None)
-        semantic_usage = material_info.get("semantic_usage", "")
+    if not isinstance(user_prompt, str) or not user_prompt.strip():
+        raise ValueError("VLM user prompt is missing")
+    request_images = request_image_paths(visual_image_paths)
+    prompt_text = "\n\n".join(
+        (user_prompt, prompts["few_shot_examples"], prompts["query_prompt"])
+    )
 
-        if "user_prompt" in material_info:
-            part1 = material_info["user_prompt"]
-        else:
-
-            part1 = make_user_prompt(
-                material_type,
-                opacity,
-                density,
-                dynamic_friction,
-                static_friction,
-                restitution,
-                semantic_usage,
-                has_texture_sphere=image_path is not None,
-            )
-    elif (
-        dataset_name == "residential"
-        or dataset_name == "commercial"
-        or dataset_name == "vegetation"
-    ):
-        material_type = material_info.get("material_type", "unknown")
-        semantic_usage = material_info.get("semantic_usage", "")
-        object_name = material_info.get("object_name", "")
-
-        if "user_prompt" in material_info:
-            part1 = material_info["user_prompt"]
-        else:
-
-            part1 = make_user_prompt(
-                material_type,
-                semantic_usage,
-                object_name,
-                has_texture_sphere=image_path is not None,
-            )
-
-    reference_info = ""
-    ref_materials = find_reference_materials(MATERIAL_RANGES, material_type)
-    if ref_materials:
-        reference_info += "\nAdditional reference material property ranges to help you make accurate estimations:\n"
-        for rm in ref_materials:
-            try:
-                y_min, y_max = parse_numerical_range_str(rm["youngs"])
-                p_min, p_max = parse_numerical_range_str(rm["poisson"])
-                d_min, d_max = parse_numerical_range_str(rm["density"])
-
-                youngs_range_str = f"{y_min}" if y_min == y_max else f"{y_min}-{y_max}"
-                poisson_range_str = f"{p_min}" if p_min == p_max else f"{p_min}-{p_max}"
-                density_range_str = f"{d_min}" if d_min == d_max else f"{d_min}-{d_max}"
-
-            except ValueError as e:
-                logging.warning(
-                    f"Could not parse range for material {rm.get('name', 'Unknown')}: {e}. Skipping this reference material."
-                )
-                continue
-
-            reference_info += (
-                f"  - {rm['name']}: Young's modulus range {youngs_range_str} GPa, "
-                f"Poisson's ratio range {poisson_range_str}, Density range {density_range_str} kg/m^3\n"
-            )
-
-    prompt_text = f"""
-{part1}
-
-{reference_info}
-
-{PROMPTS["few_shot_examples"]}
-
-{PROMPTS["query_prompt"]}
-"""
-
-    if isinstance(processor, str) and processor.startswith("gemini"):
-
+    if isinstance(processor, ResponsesAPIConfig):
+        output_text = ""
+        web_search_used = False
         try:
-
             message_content = []
-
+            for role, request_image_path in request_images:
+                encoded_image = encode_image(request_image_path)
+                message_content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{encoded_image}",
+                        "detail": processor.image_detail,
+                    }
+                )
+                logging.info("Added %s image to Responses API request", role)
             message_content.append(
-                {"type": "text", "text": SYSTEM_PROMPT + "\n\n" + prompt_text}
+                {
+                    "type": "input_text",
+                    "text": prompt_text,
+                }
             )
 
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                base64_thumbnail = encode_image(thumbnail_path)
-                message_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64_thumbnail}"
-                        },
-                    }
-                )
-                logging.info(f"Added thumbnail image to Gemini request")
-
-            if image_path and os.path.exists(image_path):
-                base64_texture = encode_image(image_path)
-                message_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64_texture}"},
-                    }
-                )
-                logging.info(f"Added texture sphere image to Gemini request")
-
-            response = model.chat.completions.create(
-                model=processor,
-                messages=[{"role": "user", "content": message_content}],
-                max_tokens=4096,
-                temperature=0.7,
+            retry_count = 0
+            while True:
+                api_retry_gate.wait()
+                try:
+                    response = model.responses.create(
+                        model=processor.model,
+                        reasoning={"effort": processor.reasoning_effort},
+                        tools=[{"type": "web_search"}],
+                        input=[
+                            {
+                                "role": "system",
+                                "content": [
+                                    {"type": "input_text", "text": SYSTEM_PROMPT}
+                                ],
+                            },
+                            {"role": "user", "content": message_content},
+                        ],
+                        max_output_tokens=processor.max_output_tokens,
+                    )
+                    break
+                except (APIConnectionError, APIStatusError) as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    transient = isinstance(exc, APIConnectionError) or (
+                        isinstance(status_code, int) and status_code >= 400
+                    )
+                    if not transient:
+                        raise
+                    if retry_count >= processor.max_retries:
+                        raise
+                    retry_count += 1
+                    api_retry_gate.pause(retry_after_seconds(exc))
+            search_calls = completed_web_search_calls(response)
+            web_search_used = bool(search_calls)
+            logging.info(
+                "Responses API completed web search: %s (completed calls: %d)",
+                web_search_used,
+                len(search_calls),
             )
+            response_status = getattr(response, "status", None)
+            if response_status != "completed":
+                raise ValueError(
+                    "Responses API did not complete successfully "
+                    f"(status={response_status!r})"
+                )
+            if getattr(response, "error", None) is not None:
+                raise ValueError("Responses API returned a response-level error")
+            if getattr(response, "incomplete_details", None) is not None:
+                raise ValueError("Responses API returned incomplete output")
+            response_model = str(getattr(response, "model", None) or processor.model)
+            output_text = response.output_text
+            if not isinstance(output_text, str) or not output_text.strip():
+                raise ValueError("Responses API returned no output text")
 
-            output_text = response.choices[0].message.content
-
-            return parse_vlm_properties(output_text)
-
+            parsed = parse_vlm_properties(output_text)
+            parsed["response_model"] = response_model
+            parsed["request_prompt"] = prompt_text
+            parsed["web_search_used"] = web_search_used
+            fingerprint = getattr(response, "system_fingerprint", None)
+            if fingerprint is not None:
+                parsed["response_system_fingerprint"] = str(fingerprint)
+            return parsed
         except Exception as e:
-            logging.error(f"Error in Gemini VLM analysis: {str(e)}")
-            import traceback
-
-            logging.error(traceback.format_exc())
-            return {"error": str(e), "raw_vlm_output": "Error generating response"}
-
-    elif isinstance(processor, str) and (
-        processor.startswith("nvdev") or "llama-3.2-90b-vision" in processor
-    ):
-
-        try:
-
-            message_content = []
-
-            message_content.append(
-                {"type": "text", "text": SYSTEM_PROMPT + "\n\n" + prompt_text}
+            logging.error(f"Error in Responses API VLM analysis: {str(e)}")
+            logging.exception("Responses API request failed")
+            return vlm_error_result(
+                e,
+                raw_output=output_text,
+                request_prompt=prompt_text,
+                web_search_used=web_search_used,
             )
 
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                base64_thumbnail = encode_image(thumbnail_path)
-                message_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{base64_thumbnail}"
-                        },
-                    }
-                )
-                logging.info(f"Added thumbnail image to NVIDIA llama vision request")
+    user_content = []
 
-            if image_path and os.path.exists(image_path):
-                base64_texture = encode_image(image_path)
-                message_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64_texture}"},
-                    }
-                )
-                logging.info(
-                    f"Added texture sphere image to NVIDIA llama vision request"
-                )
+    for role, request_image_path in request_images:
+        file_uri = f"file://{os.path.abspath(request_image_path)}"
+        logging.info("Using %s image: %s", role, file_uri)
+        user_content.append({"type": "image", "image": file_uri})
 
-            response = model.chat.completions.create(
-                model=processor,
-                messages=[{"role": "user", "content": message_content}],
-                max_tokens=4096,
-                temperature=0.5,
-            )
+    user_content.append({"type": "text", "text": prompt_text})
 
-            output_text = response.choices[0].message.content
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
-            return parse_vlm_properties(output_text)
+    try:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
 
-        except Exception as e:
-            logging.error(f"Error in NVIDIA llama vision VLM analysis: {str(e)}")
-            import traceback
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+        )
 
-            logging.error(traceback.format_exc())
-            return {"error": str(e), "raw_vlm_output": "Error generating response"}
+        inputs = inputs.to(model.device)
 
-    else:
-
-        user_content = []
-
-        if thumbnail_path:
-            thumb_uri = f"file://{os.path.abspath(thumbnail_path)}"
-            logging.info(f"Using thumbnail image: {thumb_uri}")
-            user_content.append({"type": "image", "image": thumb_uri})
-
-        if image_path:
-
-            absolute_image_path = os.path.abspath(image_path)
-            file_uri = f"file://{absolute_image_path}"
-            user_content.append({"type": "image", "image": file_uri})
-
-        user_content.append({"type": "text", "text": prompt_text})
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
+        generated_ids = model.generate(
+            **inputs, max_new_tokens=4096, do_sample=False
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
+        output_text = processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
 
-        try:
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+        parsed = parse_vlm_properties(output_text)
+        parsed["response_model"] = vlm_model_identity(model, processor)
+        parsed["request_prompt"] = prompt_text
+        return parsed
 
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                return_tensors="pt",
-            )
+    except Exception as e:
+        logging.error(f"Error in VLM analysis: {str(e)}")
 
-            inputs = inputs.to(model.device)
-
-            generated_ids = model.generate(**inputs, max_new_tokens=4096)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :]
-                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
-
-            return parse_vlm_properties(output_text)
-
-        except Exception as e:
-            logging.error(f"Error in VLM analysis: {str(e)}")
-            import traceback
-
-            logging.error(traceback.format_exc())
-            return {"error": str(e), "raw_vlm_output": "Error generating response"}
+        logging.error(traceback.format_exc())
+        return vlm_error_result(e, request_prompt=prompt_text)
