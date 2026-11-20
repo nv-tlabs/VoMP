@@ -167,7 +167,7 @@ def main():
             if rho_key is not None:
                 rho_arr = _np.asarray(data[rho_key]).reshape(-1)
                 if rho_arr.shape[0] == tet_count:
-                    pos = state_0.particle_q.numpy()
+                    pos = model.particle_q.numpy()
                     tet_idx = model.tet_indices.numpy().reshape(-1, 4)
 
                     def tet_vol(a, b, c, d):
